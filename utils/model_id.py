@@ -57,6 +57,7 @@ def identify_fopdt(pv, sp, co, ts, method="area", step_start=None, step_end=None
     ss_res = np.sum(residuals ** 2)
     ss_tot = np.sum((pv_seg - np.mean(pv_seg)) ** 2)
     r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    r_squared = max(0.0, min(1.0, r_squared))
 
     result = {
         "K": float(K_id),
@@ -133,24 +134,33 @@ def _area_method(pv_seg, pv_init, K, delta_co, ts):
 
     pv_inf = K * delta_co
     if abs(pv_inf) < 1e-10:
-        return None
+        pv_inf = np.mean(pv_response[-max(50, n//4):])
+        if abs(pv_inf) < 1e-10:
+            return None
 
     t63 = 0
+    target = abs(pv_inf) * 0.632
     for i in range(n):
-        if abs(pv_response[i]) >= abs(pv_inf) * 0.632:
+        if abs(pv_response[i]) >= target:
             t63 = i * ts
             break
 
     if t63 <= 0:
         t63 = n * ts * 0.4
 
-    L = max(t63 - total_area / pv_inf, 0)
+    if pv_inf != 0:
+        L = max(t63 - total_area / pv_inf, 0)
+    else:
+        L = t63 * 0.3
     T = t63 - L
 
-    if T < ts:
+    if T < ts * 3:
         T = ts * 5
-    if L < 0:
-        L = 0
+    if L < ts:
+        L = ts
+    if L > t63 * 0.8:
+        L = t63 * 0.25
+        T = t63 - L
 
     return K, T, L
 

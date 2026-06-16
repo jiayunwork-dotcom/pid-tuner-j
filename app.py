@@ -633,7 +633,7 @@ def _section_model_id(loop, pv, sp, co, ts):
                         {"label": "面积法 (Smith)", "value": "area"},
                         {"label": "优化拟合法", "value": "optimization"},
                         {"label": "继电反馈法", "value": "relay"},
-                    ], value="area", size="sm", className="mb-2"),
+                    ], value="optimization", size="sm", className="mb-2"),
                     dbc.Button("开始辨识", id="btn-identify", color="primary", size="sm",
                                 className="me-2"),
                     dbc.Button("自动检测阶跃", id="btn-auto-step", color="secondary", size="sm"),
@@ -788,28 +788,31 @@ def run_model_identification(identify_clicks, auto_clicks, method, selected, loo
         legend=dict(orientation="h", y=1.12),
     )
 
+    r2 = result["r_squared"]
+    if r2 < 0.5:
+        r2_color = "text-danger"
+        r2_note = " (拟合效果较差，建议使用优化法或检查数据)"
+    elif r2 < 0.8:
+        r2_color = "text-warning"
+        r2_note = " (拟合效果一般)"
+    else:
+        r2_color = "text-success"
+        r2_note = ""
+
     result_html = html.Div([
         html.P(f"增益 K = {result['K']:.4f}", className="text-white small mb-1"),
         html.P(f"时间常数 T = {result['T']:.2f} s", className="text-white small mb-1"),
         html.P(f"纯滞后 L = {result['L']:.2f} s", className="text-white small mb-1"),
-        html.P(f"R² = {result['r_squared']:.4f}", className="text-white small"),
+        html.P([
+            html.Span(f"R² = {r2:.4f}", className=f"{r2_color} small"),
+            html.Span(r2_note, className="text-muted small"),
+        ], className="mb-1"),
     ])
 
     return result_html, fig, model_stored
 
 
-@app.callback(
-    Output("tuning-table-container", "children"),
-    Output("tuning-store", "data"),
-    Input("btn-tune", "n_clicks"),
-    State("model-store", "data"),
-    State("lambda-input", "value"),
-    State("imc-filter-input", "value"),
-    State("selected-loop", "data"),
-    State("loops-store", "data"),
-    prevent_initial_call=True,
-)
-def compute_tuning(clicks, model_data, lambda_val, imc_filter, selected, loops):
+def _render_tuning_table(model_data, lambda_val, imc_filter, selected, loops):
     if not model_data or model_data.get("method") == "relay":
         return html.P("请先辨识FOPDT模型", className="text-muted small"), {}
 
@@ -847,6 +850,33 @@ def compute_tuning(clicks, model_data, lambda_val, imc_filter, selected, loops):
     tuning_stored = {k: v for k, v in recommendations.items()}
 
     return table, tuning_stored
+
+
+@app.callback(
+    Output("tuning-table-container", "children"),
+    Output("tuning-store", "data"),
+    Input("btn-tune", "n_clicks"),
+    Input("model-store", "data"),
+    State("lambda-input", "value"),
+    State("imc-filter-input", "value"),
+    State("selected-loop", "data"),
+    State("loops-store", "data"),
+    prevent_initial_call=True,
+)
+def compute_tuning(clicks, model_data, lambda_val, imc_filter, selected, loops):
+    ctx = dash.callback_context
+    trigger = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    if "model-store" in trigger:
+        if not model_data:
+            return html.P("请先辨识FOPDT模型", className="text-muted small"), {}
+        if model_data.get("method") == "relay":
+            return html.P([
+                html.I(className="fas fa-info-circle me-2"),
+                "继电反馈法已完成，可用于部分整定方法",
+            ], className="text-info small"), {}
+
+    return _render_tuning_table(model_data, lambda_val, imc_filter, selected, loops)
 
 
 @app.callback(
@@ -1241,4 +1271,4 @@ def toggle_compare_modal(open_clicks, close_clicks, loops, is_open):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8050, debug=True)
+    app.run(host="0.0.0.0", port=8050, debug=False)

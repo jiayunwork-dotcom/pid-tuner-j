@@ -1,5 +1,8 @@
 import numpy as np
+import warnings
 from statsmodels.tsa.arima.model import ARIMA
+
+warnings.filterwarnings("ignore")
 
 
 def harris_index(pv, sp, ts, controller_type="PI"):
@@ -10,40 +13,38 @@ def harris_index(pv, sp, ts, controller_type="PI"):
     if actual_var < 1e-12:
         return 1.0, 0.0, 0.0
 
+    n = len(err_centered)
+    if n > 500:
+        step = n // 500
+        err_downsampled = err_centered[::step]
+        ts_downsampled = ts * step
+    else:
+        err_downsampled = err_centered
+        ts_downsampled = ts
+
     d = 1
     best_order = (1, d, 1)
-    try:
-        best_aic = np.inf
-        for p in [1, 2]:
-            for q in [0, 1]:
-                try:
-                    model = ARIMA(err_centered, order=(p, d, q))
-                    res = model.fit()
-                    if res.aic < best_aic:
-                        best_aic = res.aic
-                        best_order = (p, d, q)
-                except Exception:
-                    continue
-    except Exception:
-        best_order = (1, d, 1)
+    ar_params = np.array([1.0, -0.5])
+    ma_params = np.array([1.0, 0.3])
+    sigma_e = actual_var * 0.1
 
     try:
-        model = ARIMA(err_centered, order=best_order)
-        res = model.fit()
+        model = ARIMA(err_downsampled, order=(1, 1, 1))
+        res = model.fit(method="statespace", maxiter=50)
         ar_params = res.polynomial_ar
         ma_params = res.polynomial_ma
         sigma_e = np.var(res.resid)
+        best_order = (1, d, 1)
     except Exception:
         try:
-            model = ARIMA(err_centered, order=(1, 1, 1))
-            res = model.fit()
+            model = ARIMA(err_downsampled, order=(1, 1, 0))
+            res = model.fit(method="statespace", maxiter=50)
             ar_params = res.polynomial_ar
-            ma_params = res.polynomial_ma
+            ma_params = np.array([1.0])
             sigma_e = np.var(res.resid)
+            best_order = (1, d, 0)
         except Exception:
-            ar_params = np.array([1.0, -0.5])
-            ma_params = np.array([1.0, 0.3])
-            sigma_e = actual_var * 0.1
+            pass
 
     delay_samples = max(1, int(_estimate_delay(err, ts) / ts))
 
