@@ -261,6 +261,7 @@ app.layout = dbc.Container(fluid=True, style={
     dcc.Store(id="maintenance-suggestions-store", data={}),
     dcc.Store(id="selected-prediction-loop", data=-1),
     dcc.Store(id="predictive-alerts-store", data=[]),
+    dcc.Store(id="maintenance-schedule-store", data=[]),
 
     dbc.Modal([
         dbc.ModalHeader(dbc.ModalTitle("多回路性能指标对比")),
@@ -344,13 +345,14 @@ def store_active_tab(tab_value):
     Input("maintenance-suggestions-store", "data"),
     Input("selected-prediction-loop", "data"),
     Input("predictive-alerts-store", "data"),
+    Input("maintenance-schedule-store", "data"),
     State("loops-store", "data"),
 )
 def render_tab_content(tab_value, selected, time_ranges, annotations_store, pending_annotation,
                        metrics_history, inspection_history, alert_records, alert_rules,
                        inspection_status, alert_confirms, silence_rules, trend_selected,
                        degradation_analysis, maintenance_suggestions, selected_pred_loop,
-                       predictive_alerts, loops):
+                       predictive_alerts, maintenance_schedule, loops):
     if tab_value == "tab-analysis":
         return _render_analysis_tab(selected, time_ranges, annotations_store, pending_annotation,
                                      metrics_history, loops)
@@ -360,7 +362,8 @@ def render_tab_content(tab_value, selected, time_ranges, annotations_store, pend
                                        trend_selected, predictive_alerts)
     else:
         return _render_prediction_tab(degradation_analysis, maintenance_suggestions,
-                                       selected_pred_loop, loops, inspection_history)
+                                       selected_pred_loop, loops, inspection_history,
+                                       maintenance_schedule)
 
 
 def _render_analysis_tab(selected, time_ranges, annotations_store, pending_annotation,
@@ -3315,7 +3318,7 @@ def update_alert_list(alert_records, severity_filter, search_text, alert_confirm
 
 @app.callback(
     Output("selected-loop", "data", allow_duplicate=True),
-    Output("main-tabs", "value"),
+    Output("main-tabs", "value", allow_duplicate=True),
     Output("active-tab-store", "data", allow_duplicate=True),
     Input({"type": "alert-jump-btn", "index": ALL}, "n_clicks"),
     State("alert-records-store", "data"),
@@ -3714,7 +3717,8 @@ def _health_trend_panel(inspection_history, loops, trend_selected):
 
 
 def _render_prediction_tab(degradation_analysis, maintenance_suggestions,
-                            selected_pred_loop, loops, inspection_history):
+                            selected_pred_loop, loops, inspection_history,
+                            maintenance_schedule):
     if not loops or len(loops) == 0:
         return html.Div(className="text-center mt-5", children=[
             html.I(className="fas fa-chart-line fa-4x mb-3", style={"color": COLORS["accent"]}),
@@ -3742,13 +3746,15 @@ def _render_prediction_tab(degradation_analysis, maintenance_suggestions,
             selected_suggestions = maintenance_suggestions.get(sugg_key, []) if maintenance_suggestions else []
 
     return html.Div([
-        _degradation_overview_cards(degradation_analysis, selected_pred_loop),
+        _degradation_overview_cards(degradation_analysis, selected_pred_loop, maintenance_schedule),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
         _degradation_detail_section(selected_analysis, selected_suggestions, selected_pred_loop),
+        html.Hr(className="my-3", style={"borderColor": "#333"}),
+        _maintenance_schedule_panel(selected_pred_loop, selected_suggestions, maintenance_schedule),
     ])
 
 
-def _degradation_overview_cards(degradation_analysis, selected_loop):
+def _degradation_overview_cards(degradation_analysis, selected_loop, maintenance_schedule):
     if not degradation_analysis or len(degradation_analysis) == 0:
         return dbc.Card([
             dbc.CardBody([
@@ -3756,6 +3762,15 @@ def _degradation_overview_cards(degradation_analysis, selected_loop):
                 html.P("暂无劣化分析数据", className="text-muted text-center py-4"),
             ]),
         ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
+
+    def _loop_maintenance_completed(loop_idx):
+        if not maintenance_schedule:
+            return False
+        loop_schedules = [s for s in maintenance_schedule if s.get("loop_idx") == loop_idx]
+        if not loop_schedules:
+            return False
+        pending_or_scheduled = [s for s in loop_schedules if s.get("status") in ["待排程", "已排期"]]
+        return len(pending_or_scheduled) == 0
 
     card_cols = []
     for da in degradation_analysis:
@@ -3767,6 +3782,7 @@ def _degradation_overview_cards(degradation_analysis, selected_loop):
         r_squared = health_model.get("r_squared", 0)
         is_significant = da.get("is_significant", False)
         warning_rounds = da.get("warning_rounds")
+        maintenance_completed = _loop_maintenance_completed(loop_idx)
 
         arrow = get_degradation_arrow(slope, r_squared)
 
@@ -3793,12 +3809,15 @@ def _degradation_overview_cards(degradation_analysis, selected_loop):
         else:
             score_color = COLORS["red"]
 
+        loop_name_display = [html.Strong(loop_name[:18], className="text-white small")]
+        if maintenance_completed:
+            loop_name_display.append(html.I(className="fas fa-check-circle ms-1",
+                                             style={"color": COLORS["green"], "fontSize": "12px"}))
+
         card = dbc.Card([
             dbc.CardBody([
                 html.Div([
-                    html.Div([
-                        html.Strong(loop_name[:18], className="text-white small"),
-                    ]),
+                    html.Div(loop_name_display),
                     html.Span(f"{current_score:.0f}", className="badge ms-auto",
                               style={"backgroundColor": score_color, "fontSize": "11px"}),
                 ], className="d-flex align-items-center mb-2"),
@@ -4100,6 +4119,222 @@ def _maintenance_suggestions_list(suggestions, loop_idx):
     ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
 
 
+def _maintenance_schedule_panel(selected_loop, suggestions, maintenance_schedule):
+    status_colors = {
+        "待排程": "#95a5a6",
+        "已排期": "#3498db",
+        "执行中": "#f39c12",
+        "已完成": "#27ae60",
+        "已跳过": "#7f8c8d",
+    }
+    priority_colors = {
+        "紧急": COLORS["red"],
+        "高": "#e67e22",
+        "中": COLORS["yellow"],
+        "低": COLORS["green"],
+    }
+
+    if selected_loop is None or selected_loop < 0:
+        return dbc.Card([
+            dbc.CardHeader([
+                html.H6("维护计划排程", className="text-white mb-0"),
+            ], style={"backgroundColor": COLORS["card"], "border": "none"}),
+            dbc.CardBody([
+                html.Div(className="text-center py-5", children=[
+                    html.I(className="fas fa-calendar-alt fa-3x mb-3", style={"color": "#666"}),
+                    html.P("请先选择一个回路", className="text-muted"),
+                ]),
+            ]),
+        ], style={"backgroundColor": COLORS["panel"]})
+
+    loop_schedules = [s for s in maintenance_schedule if s.get("loop_idx") == selected_loop] if maintenance_schedule else []
+
+    scheduled_action_keys = set()
+    for s in loop_schedules:
+        if s.get("action"):
+            scheduled_action_keys.add(s["action"])
+
+    pending_suggestions = []
+    if suggestions:
+        for i, sugg in enumerate(suggestions):
+            action = sugg.get("action", "")
+            if action not in scheduled_action_keys:
+                pending_suggestions.append({"idx": i, **sugg})
+
+    left_items = []
+    if pending_suggestions:
+        for sugg in pending_suggestions:
+            priority = sugg.get("priority", "低")
+            action = sugg.get("action", "")
+            description = sugg.get("description", "")
+
+            left_items.append(dbc.Card([
+                dbc.CardBody([
+                    html.Div([
+                        html.Span(priority, className="badge me-2",
+                                  style={"backgroundColor": priority_colors.get(priority, "#666"),
+                                         "fontSize": "10px"}),
+                        html.Strong(action, className="text-white small"),
+                    ], className="mb-2"),
+                    html.P(description, className="text-light small mb-2",
+                           style={"fontSize": "11px", "lineHeight": "1.4"}),
+                    dbc.Button(
+                        [html.I(className="fas fa-plus me-1"), "加入计划"],
+                        id={"type": "add-schedule-btn", "index": f"{selected_loop}-{sugg['idx']}"},
+                        size="sm",
+                        color="success",
+                        outline=True,
+                        style={"fontSize": "11px"},
+                    ),
+                ], style={"padding": "10px"}),
+            ], style={
+                "backgroundColor": COLORS["card"],
+                "marginBottom": "6px",
+                "borderLeft": f"3px solid {priority_colors.get(priority, '#666')}",
+                "borderRadius": "4px",
+            }))
+    else:
+        left_items = [html.P("所有建议已加入计划", className="text-muted text-center py-4")]
+
+    sorted_schedules = sorted(loop_schedules, key=lambda x: x.get("scheduled_time", ""))
+
+    right_items = []
+    if sorted_schedules:
+        for sched in sorted_schedules:
+            plan_id = sched.get("plan_id", "")
+            status = sched.get("status", "待排程")
+            action = sched.get("action", "")
+            priority = sched.get("priority", "低")
+            scheduled_time = sched.get("scheduled_time", "")
+            actual_time = sched.get("actual_time", "")
+            notes = sched.get("notes", "")
+
+            status_label = html.Span(status, className="badge",
+                                      style={"backgroundColor": status_colors.get(status, "#666"),
+                                             "fontSize": "10px"})
+
+            time_display = scheduled_time if scheduled_time else "未设置"
+            if status == "已完成" and actual_time:
+                time_display = f"实际: {actual_time}"
+
+            notes_disabled = status != "已完成"
+
+            right_items.append(dbc.Card([
+                dbc.CardBody([
+                    html.Div([
+                        status_label,
+                        html.Span(priority, className="badge ms-2",
+                                  style={"backgroundColor": priority_colors.get(priority, "#666"),
+                                         "fontSize": "10px"}),
+                        html.Strong(action, className="text-white small ms-2"),
+                    ], className="mb-2"),
+                    html.Div([
+                        html.I(className="far fa-clock text-info me-1", style={"fontSize": "11px"}),
+                        html.Small(time_display, className="text-light"),
+                    ], className="mb-2"),
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label("状态", className="text-light small mb-1"),
+                            dbc.Select(
+                                id={"type": "schedule-status-select", "index": plan_id},
+                                options=[
+                                    {"label": "待排程", "value": "待排程"},
+                                    {"label": "已排期", "value": "已排期"},
+                                    {"label": "执行中", "value": "执行中"},
+                                    {"label": "已完成", "value": "已完成"},
+                                    {"label": "已跳过", "value": "已跳过"},
+                                ],
+                                value=status,
+                                size="sm",
+                            ),
+                        ], width=6),
+                        dbc.Col([
+                            dbc.Label("预计时间", className="text-light small mb-1"),
+                            dbc.Input(
+                                id={"type": "schedule-time-input", "index": plan_id},
+                                type="text",
+                                value=scheduled_time,
+                                size="sm",
+                                placeholder="YYYY-MM-DD HH:MM",
+                            ),
+                        ], width=6),
+                    ], className="mb-2"),
+                    dbc.Label("执行备注", className="text-light small mb-1"),
+                    dbc.Textarea(
+                        id={"type": "schedule-notes-input", "index": plan_id},
+                        value=notes,
+                        size="sm",
+                        rows=2,
+                        placeholder="记录维护结果...",
+                        disabled=notes_disabled,
+                        style={"fontSize": "11px", "resize": "none"},
+                    ),
+                ], style={"padding": "10px"}),
+            ], style={
+                "backgroundColor": COLORS["card"],
+                "marginBottom": "8px",
+                "borderLeft": f"3px solid {status_colors.get(status, '#666')}",
+                "borderRadius": "4px",
+            }))
+    else:
+        right_items = [html.P("暂无排程计划，请从左侧添加", className="text-muted text-center py-4")]
+
+    status_counts = {}
+    for s in ["待排程", "已排期", "执行中", "已完成", "已跳过"]:
+        count = sum(1 for sched in loop_schedules if sched.get("status") == s)
+        if count > 0:
+            status_counts[s] = count
+
+    stats_items = []
+    stats_with_data = [status_name for status_name in ["待排程", "已排期", "执行中", "已完成", "已跳过"] if status_name in status_counts]
+    for idx, status_name in enumerate(stats_with_data):
+        if idx > 0:
+            stats_items.append(html.Span(" | ", className="text-muted small mx-1"))
+        stats_items.append(html.Span([
+            html.Span(status_name, className="small", style={"color": "#ccc"}),
+            html.Span(f"{status_counts[status_name]}条", className="fw-bold ms-1",
+                      style={"color": status_colors.get(status_name, "#666")}),
+        ]))
+
+    default_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    return dbc.Card([
+        dbc.CardHeader([
+            html.H6("维护计划排程", className="text-white mb-0"),
+        ], style={"backgroundColor": COLORS["card"], "border": "none"}),
+        dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H6("待排程建议", className="text-warning small mb-2 fw-bold"),
+                        html.Div(left_items, style={"maxHeight": "400px", "overflowY": "auto"}),
+                    ]),
+                ], width=4),
+                dbc.Col([
+                    html.Div([
+                        html.Div([
+                            html.H6("维护计划时间线", className="text-info small mb-2 fw-bold d-inline-block"),
+                            html.Div([
+                                dbc.Label("新计划默认时间:", className="text-light small me-2 mb-0"),
+                                dbc.Input(
+                                    id="schedule-default-datetime",
+                                    type="text",
+                                    value=default_datetime,
+                                    size="sm",
+                                    style={"width": "160px", "display": "inline-block", "fontSize": "11px"},
+                                ),
+                            ], className="float-end"),
+                        ], className="mb-2"),
+                        html.Div(right_items, style={"maxHeight": "400px", "overflowY": "auto"}),
+                    ]),
+                ], width=8),
+            ]),
+            html.Hr(className="my-2", style={"borderColor": "#333"}),
+            html.Div(stats_items, className="text-center"),
+        ]),
+    ], style={"backgroundColor": COLORS["panel"]})
+
+
 @app.callback(
     Output("alert-confirm-store", "data"),
     Input({"type": "alert-confirm-btn", "index": ALL}, "n_clicks"),
@@ -4395,7 +4630,7 @@ def select_prediction_loop(clicks, current_selected, degradation_analysis):
 
 
 @app.callback(
-    Output("main-tabs", "value", allow_duplicate=True),
+    Output("main-tabs", "value"),
     Output("selected-loop", "data", allow_duplicate=True),
     Input("prediction-jump-to-analysis", "n_clicks"),
     State("selected-prediction-loop", "data"),
@@ -4406,36 +4641,6 @@ def jump_from_prediction_to_analysis(n_clicks, selected_pred_loop):
         return dash.no_update, dash.no_update
 
     return "tab-analysis", selected_pred_loop
-
-
-@app.callback(
-    Output("main-tabs", "value", allow_duplicate=True),
-    Output("selected-loop", "data", allow_duplicate=True),
-    Input({"type": "alert-jump-btn", "index": ALL}, "n_clicks"),
-    prevent_initial_call=True,
-)
-def jump_from_alert_to_analysis(alert_clicks):
-    if not alert_clicks or all(c is None or c == 0 for c in alert_clicks):
-        return dash.no_update, dash.no_update
-
-    ctx_cb = callback_context
-    if not ctx_cb.triggered:
-        return dash.no_update, dash.no_update
-
-    triggered_id = ctx_cb.triggered_id
-    if not isinstance(triggered_id, dict):
-        return dash.no_update, dash.no_update
-
-    loop_idx_str = triggered_id.get("index", "-1")
-    try:
-        loop_idx = int(loop_idx_str)
-    except (ValueError, TypeError):
-        return dash.no_update, dash.no_update
-
-    if loop_idx < 0:
-        return dash.no_update, dash.no_update
-
-    return "tab-analysis", loop_idx
 
 
 @app.callback(
@@ -4471,6 +4676,180 @@ def generate_predictive_alerts(degradation_analysis, loops):
             })
 
     return predictive_alerts
+
+
+@app.callback(
+    Output("maintenance-schedule-store", "data"),
+    Input({"type": "add-schedule-btn", "index": ALL}, "n_clicks"),
+    State("maintenance-schedule-store", "data"),
+    State("maintenance-suggestions-store", "data"),
+    State("schedule-default-datetime", "value"),
+    State("selected-prediction-loop", "data"),
+    prevent_initial_call=True,
+)
+def add_schedule_from_suggestion(add_clicks, schedule_store, suggestions_store, default_datetime, selected_loop):
+    ctx_cb = callback_context
+    if not ctx_cb.triggered:
+        return dash.no_update
+
+    triggered = ctx_cb.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        return dash.no_update
+
+    index_str = triggered.get("index", "")
+    if not index_str:
+        return dash.no_update
+
+    try:
+        parts = index_str.split("-")
+        loop_idx = int(parts[0])
+        sugg_idx = int(parts[1])
+    except (ValueError, IndexError):
+        return dash.no_update
+
+    suggestions = suggestions_store.get(str(loop_idx), []) if suggestions_store else []
+    if sugg_idx >= len(suggestions):
+        return dash.no_update
+
+    suggestion = suggestions[sugg_idx]
+
+    plan_id = f"plan-{int(time.time() * 1000)}"
+
+    new_schedule = {
+        "plan_id": plan_id,
+        "loop_idx": loop_idx,
+        "status": "待排程",
+        "priority": suggestion.get("priority", "低"),
+        "action": suggestion.get("action", ""),
+        "description": suggestion.get("description", ""),
+        "scheduled_time": default_datetime,
+        "actual_time": "",
+        "notes": "",
+    }
+
+    schedule_list = list(schedule_store) if schedule_store else []
+    schedule_list.append(new_schedule)
+
+    return schedule_list
+
+
+@app.callback(
+    Output("maintenance-schedule-store", "data", allow_duplicate=True),
+    Input({"type": "schedule-status-select", "index": ALL}, "value"),
+    State("maintenance-schedule-store", "data"),
+    prevent_initial_call=True,
+)
+def update_schedule_status(status_values, schedule_store):
+    ctx_cb = callback_context
+    if not ctx_cb.triggered:
+        return dash.no_update
+
+    triggered = ctx_cb.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        return dash.no_update
+
+    plan_id = triggered.get("index", "")
+    if not plan_id:
+        return dash.no_update
+
+    triggered_value = ctx_cb.triggered[0].get("value", "")
+    if not triggered_value:
+        return dash.no_update
+
+    schedule_list = list(schedule_store) if schedule_store else []
+    updated = False
+
+    for i, sched in enumerate(schedule_list):
+        if sched.get("plan_id") == plan_id:
+            old_status = sched.get("status", "")
+            new_status = triggered_value
+            schedule_list[i]["status"] = new_status
+
+            if new_status == "已完成" and old_status != "已完成":
+                schedule_list[i]["actual_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            elif new_status != "已完成" and old_status == "已完成":
+                schedule_list[i]["actual_time"] = ""
+
+            updated = True
+            break
+
+    if not updated:
+        return dash.no_update
+
+    return schedule_list
+
+
+@app.callback(
+    Output("maintenance-schedule-store", "data", allow_duplicate=True),
+    Input({"type": "schedule-time-input", "index": ALL}, "value"),
+    State("maintenance-schedule-store", "data"),
+    prevent_initial_call=True,
+)
+def update_schedule_time(time_values, schedule_store):
+    ctx_cb = callback_context
+    if not ctx_cb.triggered:
+        return dash.no_update
+
+    triggered = ctx_cb.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        return dash.no_update
+
+    plan_id = triggered.get("index", "")
+    if not plan_id:
+        return dash.no_update
+
+    triggered_value = ctx_cb.triggered[0].get("value", "")
+
+    schedule_list = list(schedule_store) if schedule_store else []
+    updated = False
+
+    for i, sched in enumerate(schedule_list):
+        if sched.get("plan_id") == plan_id:
+            schedule_list[i]["scheduled_time"] = triggered_value
+            updated = True
+            break
+
+    if not updated:
+        return dash.no_update
+
+    return schedule_list
+
+
+@app.callback(
+    Output("maintenance-schedule-store", "data", allow_duplicate=True),
+    Input({"type": "schedule-notes-input", "index": ALL}, "value"),
+    State("maintenance-schedule-store", "data"),
+    prevent_initial_call=True,
+)
+def update_schedule_notes(notes_values, schedule_store):
+    ctx_cb = callback_context
+    if not ctx_cb.triggered:
+        return dash.no_update
+
+    triggered = ctx_cb.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        return dash.no_update
+
+    plan_id = triggered.get("index", "")
+    if not plan_id:
+        return dash.no_update
+
+    triggered_value = ctx_cb.triggered[0].get("value", "")
+
+    schedule_list = list(schedule_store) if schedule_store else []
+    updated = False
+
+    for i, sched in enumerate(schedule_list):
+        if sched.get("plan_id") == plan_id:
+            if sched.get("status") == "已完成":
+                schedule_list[i]["notes"] = triggered_value
+                updated = True
+            break
+
+    if not updated:
+        return dash.no_update
+
+    return schedule_list
 
 
 if __name__ == "__main__":
