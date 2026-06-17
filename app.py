@@ -142,6 +142,9 @@ app.layout = dbc.Container(fluid=True, style={
     dcc.Store(id="model-store", data={}),
     dcc.Store(id="tuning-store", data={}),
     dcc.Store(id="time-range-store", data={}),
+    dcc.Store(id="annotations-store", data={}),
+    dcc.Store(id="annotation-pending", data=None),
+    dcc.Store(id="metrics-history-store", data={}),
     dcc.Download(id="download-report"),
 
     dbc.Modal([
@@ -151,6 +154,15 @@ app.layout = dbc.Container(fluid=True, style={
             dbc.Button("关闭", id="btn-close-compare", className="ms-auto", size="sm")
         ),
     ], id="compare-modal", size="xl", scrollable=True),
+
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("性能指标历史记录")),
+        dbc.ModalBody(id="history-modal-body"),
+        dbc.ModalFooter([
+            dbc.Button("清空历史", id="btn-clear-history-modal", color="danger", size="sm", className="me-auto"),
+            dbc.Button("关闭", id="btn-close-history", className="ms-auto", size="sm"),
+        ]),
+    ], id="history-modal", size="xl", scrollable=True, is_open=False),
 ])
 
 
@@ -281,9 +293,13 @@ def update_loop_selection(selected, loops):
     Output("health-ranking", "children"),
     Input("selected-loop", "data"),
     Input("time-range-store", "data"),
+    Input("annotations-store", "data"),
+    Input("annotation-pending", "data"),
+    Input("metrics-history-store", "data"),
     State("loops-store", "data"),
 )
-def render_main_content(selected, time_ranges, loops):
+def render_main_content(selected, time_ranges, annotations_store, pending_annotation,
+                         metrics_history, loops):
     if not loops or selected < 0 or selected >= len(loops):
         return html.Div(className="text-center mt-5", children=[
             html.I(className="fas fa-industry fa-4x mb-3", style={"color": COLORS["accent"]}),
@@ -356,19 +372,30 @@ def render_main_content(selected, time_ranges, loops):
 
     ranking_children = _build_ranking(loops, selected)
 
+    annotations = annotations_store.get(str(selected), []) if annotations_store else []
+    pending = pending_annotation if pending_annotation and pending_annotation.get("loop_idx") == selected else None
+
+    history = metrics_history.get(str(selected), []) if metrics_history else []
+    last_record = history[-1] if history else None
+
+    harris_segments = _compute_harris_segments(pv, sp, co, ts, loop["controller_type"])
+
+    spectrum_data = _compute_spectrum(pv, ts)
+
     content = html.Div([
-        _section_timeseries(pv_full, sp_full, co_full, ts, loop, selected_range, range_display),
+        _section_timeseries(pv_full, sp_full, co_full, ts, loop, selected_range,
+                            range_display, annotations, pending),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
 
         dbc.Row([
-            dbc.Col(_section_metrics(metrics), width=6),
+            dbc.Col(_section_metrics(metrics, last_record), width=6),
             dbc.Col(_section_radar(metrics), width=6),
         ]),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
 
         dbc.Row([
-            dbc.Col(_section_harris(harris_val, improvement), width=4),
-            dbc.Col(_section_oscillation(osc_result, ts), width=4),
+            dbc.Col(_section_harris(harris_val, improvement, harris_segments), width=4),
+            dbc.Col(_section_oscillation(osc_result, ts, spectrum_data), width=4),
             dbc.Col(_section_stiction(stic_result, pv, sp, co), width=4),
         ]),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
@@ -382,7 +409,8 @@ def render_main_content(selected, time_ranges, loops):
     return content, analysis_data, ranking_children
 
 
-def _section_timeseries(pv, sp, co, ts, loop, selected_range=None, range_display=""):
+def _section_timeseries(pv, sp, co, ts, loop, selected_range=None, range_display="",
+                         annotations=None, pending_annotation=None):
     n = len(pv)
     t = np.arange(n) * ts
 
@@ -393,6 +421,8 @@ def _section_timeseries(pv, sp, co, ts, loop, selected_range=None, range_display
                               yaxis="y2"))
 
     shapes = []
+    annotations_list = []
+
     if selected_range and "x" in selected_range:
         x_range = selected_range["x"]
         shapes.append(dict(
@@ -405,6 +435,77 @@ def _section_timeseries(pv, sp, co, ts, loop, selected_range=None, range_display
             y1=1,
             fillcolor="rgba(233, 69, 96, 0.15)",
             line=dict(color=COLORS["accent"], width=2, dash="dash"),
+        ))
+
+    if annotations:
+        for i, ann in enumerate(annotations):
+            x0, x1 = ann["x0"], ann["x1"]
+            y0, y1 = ann["y0"], ann["y1"]
+            shapes.append(dict(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=x0,
+                y0=y0,
+                x1=x1,
+                y1=y1,
+                line=dict(color="#ff9f43", width=2.5),
+            ))
+            shapes.append(dict(
+                type="circle",
+                xref="x",
+                yref="y",
+                x0=x0 - 2,
+                y0=y0 - (y1 - y0) * 0.02,
+                x1=x0 + 2,
+                y1=y0 + (y1 - y0) * 0.02,
+                fillcolor="#ff9f43",
+                line=dict(color="#ff9f43", width=1),
+            ))
+            shapes.append(dict(
+                type="circle",
+                xref="x",
+                yref="y",
+                x0=x1 - 2,
+                y0=y1 - (y1 - y0) * 0.02,
+                x1=x1 + 2,
+                y1=y1 + (y1 - y0) * 0.02,
+                fillcolor="#ff9f43",
+                line=dict(color="#ff9f43", width=1),
+            ))
+
+            mid_x = (x0 + x1) / 2
+            mid_y = (y0 + y1) / 2
+            slope = ann.get("slope", 0)
+            duration = ann.get("duration", 0)
+            annotations_list.append(dict(
+                x=mid_x,
+                y=mid_y,
+                xref="x",
+                yref="y",
+                text=f"斜率: {slope:.4f}/s<br>时长: {duration:.1f}s",
+                showarrow=False,
+                font=dict(color="#ff9f43", size=10),
+                bgcolor="rgba(0,0,0,0.7)",
+                bordercolor="#ff9f43",
+                borderwidth=1,
+                borderpad=3,
+                ay=-30,
+            ))
+
+    if pending_annotation and "x" in pending_annotation:
+        x0 = pending_annotation["x"]
+        y0 = pending_annotation["y"]
+        shapes.append(dict(
+            type="circle",
+            xref="x",
+            yref="y",
+            x0=x0 - 3,
+            y0=y0 - (np.max(pv) - np.min(pv)) * 0.02,
+            x1=x0 + 3,
+            y1=y0 + (np.max(pv) - np.min(pv)) * 0.02,
+            fillcolor="#ff6b6b",
+            line=dict(color="#ff6b6b", width=2),
         ))
 
     fig.update_layout(
@@ -420,26 +521,64 @@ def _section_timeseries(pv, sp, co, ts, loop, selected_range=None, range_display
         margin=dict(l=50, r=50, t=50, b=40),
         dragmode="select",
         shapes=shapes,
+        annotations=annotations_list,
     )
+
+    annotation_buttons = []
+    if annotations:
+        for i, ann in enumerate(annotations):
+            annotation_buttons.append(
+                dbc.Button(
+                    [html.I(className="fas fa-times me-1"), f"标注{i+1}"],
+                    id={"type": "delete-annotation", "index": i},
+                    size="sm",
+                    color="warning",
+                    outline=True,
+                    className="me-1 mb-1",
+                    style={"fontSize": "11px"},
+                )
+            )
 
     return dbc.Card([
         dbc.CardBody([
             html.Div([
-                html.H6("数据预览与时间段选择", className="text-white mb-0"),
-                html.Small("拖拽选择分析时间段 (双击重置)", className="text-muted"),
-            ]),
+                html.Div([
+                    html.H6("数据预览与时间段选择", className="text-white mb-0"),
+                    html.Small("拖拽选择分析时间段 | 点击PV曲线添加趋势标注 | 双击重置", className="text-muted"),
+                ]),
+                html.Div([
+                    dbc.Button(
+                        [html.I(className="fas fa-tag me-1"), "添加标注"],
+                        id="btn-add-annotation",
+                        size="sm",
+                        color="warning",
+                        className="mb-2",
+                    ),
+                    dbc.Button(
+                        [html.I(className="fas fa-eraser me-1"), "清除标注"],
+                        id="btn-clear-annotations",
+                        size="sm",
+                        color="secondary",
+                        outline=True,
+                        className="mb-2 ms-1",
+                    ),
+                ]),
+            ], className="d-flex justify-content-between align-items-start"),
+            html.Div(id="annotation-status", className="small mb-2",
+                     style={"color": "#ff9f43"},
+                     children=""),
             dcc.Graph(id="timeseries-graph", figure=fig,
                       config={"modeBarButtonsToAdd": ["select2d", "resetScale2d"]}),
             html.Div(id="selected-range-display",
                      className="small mt-1",
                      children=range_display,
                      style={"color": COLORS["accent"] if selected_range else "#6c757d"}),
+            html.Div(id="annotation-tags", className="mt-2", children=annotation_buttons),
         ]),
     ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
 
 
-def _section_metrics(metrics):
-    rows = []
+def _section_metrics(metrics, last_record=None):
     labels = {
         "IAE": ("IAE 绝对误差积分", ""),
         "ISE": ("ISE 误差平方积分", ""),
@@ -458,18 +597,68 @@ def _section_metrics(metrics):
             val_str = f"{val:.4f}"
         else:
             val_str = str(val)
+
+        trend_html = html.Td("—", className="text-muted text-center", style={"width": "60px"})
+        if last_record and key in last_record.get("metrics", {}):
+            prev_val = last_record["metrics"][key]
+            if prev_val != 0 and not (isinstance(prev_val, float) and np.isnan(prev_val)):
+                change_pct = (val - prev_val) / abs(prev_val) * 100
+                if abs(change_pct) > 10:
+                    color = COLORS["red"]
+                else:
+                    color = "#ccc"
+                if change_pct > 0.5:
+                    trend_icon = "↑"
+                elif change_pct < -0.5:
+                    trend_icon = "↓"
+                else:
+                    trend_icon = "→"
+                trend_html = html.Td(
+                    html.Span(trend_icon, style={"color": color, "fontWeight": "bold", "fontSize": "14px"}),
+                    className="text-center",
+                    style={"width": "60px"}
+                )
+
         table_rows.append(html.Tr([
-            html.Td(label, className="text-light"),
-            html.Td(f"{val_str} {unit}", className="text-white"),
+            html.Td(label, className="text-light py-1"),
+            html.Td(f"{val_str} {unit}", className="text-white py-1"),
+            trend_html,
         ]))
 
     return dbc.Card([
         dbc.CardBody([
-            html.H6("性能指标", className="text-white mb-3"),
-            html.Table(table_rows, className="w-100", style={
+            html.Div([
+                html.H6("性能指标", className="text-white mb-0"),
+                html.Div([
+                    dbc.Button(
+                        [html.I(className="fas fa-save me-1"), "记录当前指标"],
+                        id="btn-record-metrics",
+                        size="sm",
+                        color="success",
+                        className="mb-2",
+                    ),
+                    dbc.Button(
+                        [html.I(className="fas fa-history me-1"), "查看历史"],
+                        id="btn-view-history",
+                        size="sm",
+                        color="info",
+                        outline=True,
+                        className="mb-2 ms-1",
+                    ),
+                ]),
+            ], className="d-flex justify-content-between align-items-start"),
+            html.Table([
+                html.Thead(html.Tr([
+                    html.Th("指标", className="text-warning small py-1", style={"fontSize": "11px"}),
+                    html.Th("当前值", className="text-warning small py-1 text-right", style={"fontSize": "11px"}),
+                    html.Th("趋势", className="text-warning small py-1 text-center", style={"width": "60px", "fontSize": "11px"}),
+                ])),
+                html.Tbody(table_rows),
+            ], className="w-100", style={
                 "fontSize": "12px",
                 "borderCollapse": "collapse",
             }),
+            html.Div(id="record-status", className="small mt-2", style={"color": COLORS["green"]}),
         ]),
     ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
 
@@ -517,7 +706,7 @@ def _section_radar(metrics):
     ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
 
 
-def _section_harris(harris_val, improvement):
+def _section_harris(harris_val, improvement, segments=None):
     gauge_color = harris_gauge_color(harris_val)
     status = harris_status_text(harris_val)
 
@@ -546,17 +735,86 @@ def _section_harris(harris_val, improvement):
         margin=dict(l=20, r=20, t=50, b=20),
     )
 
+    segment_content = html.Div()
+    if segments and len(segments) == 4:
+        seg_vals = [s["harris"] for s in segments]
+        seg_labels = [f"时段{i+1}" for i in range(4)]
+        bar_colors = []
+        abnormal_reasons = []
+
+        for i, s in enumerate(segments):
+            deviation = abs(s["harris"] - harris_val) / max(harris_val, 0.01)
+            if deviation > 0.2:
+                bar_colors.append(COLORS["red"])
+                if s.get("sp_changes", 0) > 3:
+                    reason = f"时段{i+1}: SP变化频繁({s['sp_changes']}次)，导致控制性能波动"
+                elif s.get("co_saturation_pct", 0) > 20:
+                    reason = f"时段{i+1}: CO长时间饱和({s['co_saturation_pct']:.1f}%)，阀门受限"
+                elif s.get("pv_std_ratio", 1) > 1.5:
+                    reason = f"时段{i+1}: PV波动剧烈，可能存在外部扰动"
+                else:
+                    reason = f"时段{i+1}: 与整体差异较大，建议进一步分析"
+                abnormal_reasons.append(reason)
+            else:
+                bar_colors.append(COLORS["pv"])
+
+        fig_seg = go.Figure()
+        fig_seg.add_trace(go.Bar(
+            x=seg_labels,
+            y=seg_vals,
+            marker_color=bar_colors,
+            text=[f"{v:.3f}" for v in seg_vals],
+            textposition="outside",
+            textfont=dict(color="#ccc", size=10),
+        ))
+        fig_seg.add_hline(
+            y=harris_val,
+            line_dash="dash",
+            line_color=COLORS["accent"],
+            annotation_text=f"总体: {harris_val:.3f}",
+            annotation_position="right",
+            annotation_font=dict(color=COLORS["accent"], size=10),
+        )
+        fig_seg.update_layout(
+            title=dict(text="分时段Harris指标对比", font=dict(color="white", size=12)),
+            paper_bgcolor="#0a1628",
+            plot_bgcolor="#0a1628",
+            font=dict(color="#ccc", size=10),
+            height=180,
+            margin=dict(l=40, r=20, t=30, b=30),
+            yaxis=dict(range=[0, 1.1], gridcolor="#333", title="Harris值"),
+            xaxis=dict(gridcolor="#333"),
+            showlegend=False,
+        )
+
+        reason_html = html.Div()
+        if abnormal_reasons:
+            reason_items = [html.Li(r, className="small", style={"color": COLORS["red"]})
+                            for r in abnormal_reasons]
+            reason_html = html.Div([
+                html.P("异常分析:", className="small text-warning mb-1 mt-2 fw-bold"),
+                html.Ul(reason_items, className="mb-0 ps-3"),
+            ])
+
+        segment_content = html.Div([
+            html.Hr(className="my-2", style={"borderColor": "#333"}),
+            html.H6("分时段对比", className="text-white small mb-2"),
+            dcc.Graph(figure=fig_seg, config={"displayModeBar": False}, style={"height": "180px"}),
+            reason_html,
+        ])
+
     return dbc.Card([
         dbc.CardBody([
             dcc.Graph(figure=fig, config={"displayModeBar": False}),
             html.P(status, className="text-center small mb-1",
                    style={"color": gauge_color, "fontWeight": "bold"}),
             html.P(f"潜在方差削减: {improvement:.1f}%", className="text-center text-muted small"),
+            segment_content,
         ]),
     ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
 
 
-def _section_oscillation(osc_result, ts):
+def _section_oscillation(osc_result, ts, spectrum_data=None):
     is_osc = osc_result["is_oscillating"]
     diagnosis = osc_result.get("diagnosis", {})
 
@@ -576,6 +834,77 @@ def _section_oscillation(osc_result, ts):
         xaxis=dict(gridcolor="#333"), yaxis=dict(gridcolor="#333"),
     )
 
+    spectrum_content = html.Div()
+    if spectrum_data and spectrum_data.get("freqs") is not None:
+        freqs = np.array(spectrum_data["freqs"])
+        amps = np.array(spectrum_data["amps"])
+        peaks = spectrum_data.get("peaks", [])
+
+        fig_spec = go.Figure()
+        fig_spec.add_trace(go.Scatter(
+            x=freqs, y=amps,
+            mode="lines",
+            line=dict(color=COLORS["pv"], width=1.5),
+            fill="tozeroy",
+            fillcolor="rgba(0, 210, 255, 0.2)",
+            name="频谱",
+        ))
+
+        peak_colors = ["#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff"]
+        peak_annotations = []
+        if peaks and len(peaks) > 0:
+            for i, peak in enumerate(peaks[:4]):
+                color = peak_colors[i % len(peak_colors)]
+                fig_spec.add_vline(
+                    x=peak["freq"],
+                    line_dash="dash",
+                    line_color=color,
+                    line_width=1.5,
+                )
+                peak_annotations.append({
+                    "freq": peak["freq"],
+                    "period": peak["period"],
+                    "amp": peak["amp"],
+                    "color": color,
+                    "meaning": peak.get("meaning", ""),
+                })
+
+        fig_spec.update_layout(
+            title=dict(text="频谱分析 (FFT)", font=dict(color="white", size=12)),
+            paper_bgcolor="#0a1628",
+            plot_bgcolor="#0a1628",
+            font=dict(color="#ccc", size=9),
+            height=180,
+            margin=dict(l=40, r=10, t=30, b=30),
+            xaxis=dict(title="频率 (Hz)", gridcolor="#333"),
+            yaxis=dict(title="幅值", gridcolor="#333", showticklabels=False),
+            showlegend=False,
+        )
+
+        meaning_list = html.Div()
+        if peak_annotations:
+            items = []
+            for p in peak_annotations:
+                freq_str = f"{p['freq']:.4f} Hz"
+                period_str = f"({p['period']:.1f}s周期)"
+                items.append(html.Li([
+                    html.Span("● ", style={"color": p["color"], "fontSize": "12px"}),
+                    html.Span(f"{freq_str} {period_str}", className="text-white small"),
+                    html.Br(),
+                    html.Span(p["meaning"], className="text-muted small"),
+                ], className="mb-1"))
+            meaning_list = html.Div([
+                html.P("主要频率成分:", className="small text-warning mb-1 mt-2 fw-bold"),
+                html.Ul(items, className="mb-0 ps-3", style={"listStyle": "none"}),
+            ])
+
+        spectrum_content = html.Div([
+            html.Hr(className="my-2", style={"borderColor": "#333"}),
+            html.H6("频谱分析", className="text-white small mb-2"),
+            dcc.Graph(figure=fig_spec, config={"displayModeBar": False}, style={"height": "180px"}),
+            meaning_list,
+        ])
+
     return dbc.Card([
         dbc.CardBody([
             html.Div([
@@ -585,6 +914,7 @@ def _section_oscillation(osc_result, ts):
             dcc.Graph(figure=fig_acf, config={"displayModeBar": False}),
             html.P(f"根因: {diagnosis.get('root_cause', 'N/A')}", className="small text-warning mb-1"),
             html.P(diagnosis.get("description", "")[:100], className="small text-muted"),
+            spectrum_content,
         ]),
     ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
 
@@ -1268,6 +1598,455 @@ def toggle_compare_modal(open_clicks, close_clicks, loops, is_open):
     ])
 
     return True, content
+
+
+def _compute_harris_segments(pv, sp, co, ts, controller_type):
+    n = len(pv)
+    if n < 40:
+        return None
+
+    seg_size = n // 4
+    segments = []
+
+    for i in range(4):
+        start = i * seg_size
+        end = start + seg_size if i < 3 else n
+        pv_seg = pv[start:end]
+        sp_seg = sp[start:end]
+        co_seg = co[start:end]
+
+        if len(pv_seg) < 10:
+            segments.append({"harris": 0.5, "sp_changes": 0, "co_saturation_pct": 0, "pv_std_ratio": 1})
+            continue
+
+        h_val, _, _ = harris_index(pv_seg, sp_seg, ts, controller_type)
+
+        sp_changes = np.sum(np.abs(np.diff(sp_seg)) > 0.5)
+
+        co_max = np.max(co_seg)
+        co_min = np.min(co_seg)
+        co_range = co_max - co_min if co_max > co_min else 1
+        at_max = np.sum(co_seg >= co_max - co_range * 0.02)
+        at_min = np.sum(co_seg <= co_min + co_range * 0.02)
+        co_saturation_pct = (at_max + at_min) / len(co_seg) * 100
+
+        pv_std = np.std(pv_seg)
+        overall_std = np.std(pv)
+        pv_std_ratio = pv_std / overall_std if overall_std > 0 else 1
+
+        segments.append({
+            "harris": float(h_val),
+            "sp_changes": int(sp_changes),
+            "co_saturation_pct": float(co_saturation_pct),
+            "pv_std_ratio": float(pv_std_ratio),
+        })
+
+    return segments
+
+
+def _compute_spectrum(pv, ts):
+    from scipy.fft import fft, fftfreq
+    from scipy.signal import find_peaks
+
+    n = len(pv)
+    if n < 10:
+        return {"freqs": None, "amps": None, "peaks": []}
+
+    pv_detrend = pv - np.mean(pv)
+    win = np.hanning(n)
+    pv_win = pv_detrend * win
+
+    yf = np.abs(fft(pv_win))[: n // 2]
+    freqs = fftfreq(n, d=ts)[: n // 2]
+
+    if len(yf) < 3:
+        return {"freqs": None, "amps": None, "peaks": []}
+
+    yf_norm = yf / np.max(yf) if np.max(yf) > 0 else yf
+
+    peak_indices, peak_props = find_peaks(
+        yf_norm,
+        height=0.3,
+        distance=max(1, int(n * ts * 0.01)),
+    )
+
+    peaks = []
+    if len(peak_indices) > 0:
+        peak_heights = yf[peak_indices]
+        sorted_idx = np.argsort(peak_heights)[::-1]
+        max_amp = np.max(yf) if np.max(yf) > 0 else 1
+
+        for idx in sorted_idx[:5]:
+            peak_idx = peak_indices[idx]
+            freq = freqs[peak_idx]
+            amp = yf[peak_idx]
+            period = 1.0 / freq if freq > 0 else float('inf')
+
+            meaning = _interpret_frequency(freq, period, ts, n)
+
+            peaks.append({
+                "freq": float(freq),
+                "period": float(period),
+                "amp": float(amp / max_amp),
+                "meaning": meaning,
+            })
+
+    return {
+        "freqs": freqs.tolist(),
+        "amps": yf.tolist(),
+        "peaks": peaks,
+    }
+
+
+def _interpret_frequency(freq, period, ts, n_points):
+    if period < 5:
+        return "高频成分，可能与阀门行程周期或传感器噪声有关"
+    elif period < 30:
+        return "中高频振荡，可能与控制器参数不当或阀门粘滞有关"
+    elif period < 120:
+        return "中频振荡，可能接近SP阶跃间隔或过程共振频率"
+    elif period < 600:
+        return "低频振荡，可能与上游扰动或工艺周期变化有关"
+    else:
+        return "超低频成分，可能与慢扰动或过程漂移有关"
+
+
+@app.callback(
+    Output("annotation-pending", "data"),
+    Output("annotations-store", "data"),
+    Output("annotation-status", "children"),
+    Input("timeseries-graph", "clickData"),
+    Input("btn-add-annotation", "n_clicks"),
+    Input("btn-clear-annotations", "n_clicks"),
+    Input({"type": "delete-annotation", "index": ALL}, "n_clicks"),
+    State("annotation-pending", "data"),
+    State("annotations-store", "data"),
+    State("selected-loop", "data"),
+    State("loops-store", "data"),
+    State("time-range-store", "data"),
+    prevent_initial_call=True,
+)
+def handle_annotations(click_data, add_clicks, clear_clicks, delete_clicks,
+                        pending, annotations_store, selected_idx, loops, time_ranges):
+    ctx = dash.callback_context
+    triggered = ctx.triggered_id
+
+    if not loops or selected_idx < 0:
+        return dash.no_update, dash.no_update, ""
+
+    annotations_store = dict(annotations_store) if annotations_store else {}
+    loop_key = str(selected_idx)
+    annotations = annotations_store.get(loop_key, [])
+    status_msg = ""
+
+    if triggered == "btn-clear-annotations":
+        if clear_clicks is None or clear_clicks == 0:
+            return dash.no_update, dash.no_update, ""
+        annotations = []
+        annotations_store[loop_key] = annotations
+        return None, annotations_store, "已清除所有标注"
+
+    if triggered == "btn-add-annotation":
+        if add_clicks is None or add_clicks == 0:
+            return dash.no_update, dash.no_update, ""
+        if pending is None or pending.get("loop_idx") != selected_idx:
+            return {"loop_idx": selected_idx, "step": 1}, dash.no_update, "请点击PV曲线上的起点"
+        else:
+            return None, dash.no_update, "已取消标注模式"
+
+    if isinstance(triggered, dict) and triggered.get("type") == "delete-annotation":
+        idx = triggered.get("index", 0)
+        if 0 <= idx < len(annotations):
+            del annotations[idx]
+            annotations_store[loop_key] = annotations
+        return dash.no_update, annotations_store, f"已删除标注{idx+1}"
+
+    if triggered == "timeseries-graph" and click_data:
+        points = click_data.get("points", [])
+        if not points or len(points) == 0:
+            if pending is not None and pending.get("loop_idx") == selected_idx:
+                return None, dash.no_update, "已取消标注"
+            return dash.no_update, dash.no_update, ""
+
+        point = points[0]
+        x_val = point.get("x", 0)
+        y_val = point.get("y", 0)
+
+        if pending is not None and pending.get("loop_idx") == selected_idx:
+            step = pending.get("step", 1)
+            if step == 1:
+                new_pending = {
+                    "loop_idx": selected_idx,
+                    "step": 2,
+                    "x": x_val,
+                    "y": y_val,
+                }
+                return new_pending, dash.no_update, f"起点已选 ({x_val:.1f}s, {y_val:.2f})，请点击终点"
+            elif step == 2:
+                x0 = pending.get("x", 0)
+                y0 = pending.get("y", 0)
+
+                duration = abs(x_val - x0)
+                if duration < 0.1:
+                    return dash.no_update, dash.no_update, "两点距离太近，请重新选择终点"
+
+                slope = (y_val - y0) / duration if duration > 0 else 0
+
+                new_ann = {
+                    "x0": min(x0, x_val),
+                    "x1": max(x0, x_val),
+                    "y0": y0,
+                    "y1": y_val,
+                    "slope": slope,
+                    "duration": duration,
+                }
+                annotations.append(new_ann)
+                annotations_store[loop_key] = annotations
+
+                return None, annotations_store, f"标注{len(annotations)}已添加: 斜率={slope:.4f}/s, 时长={duration:.1f}s"
+
+        return dash.no_update, dash.no_update, status_msg
+
+    return dash.no_update, dash.no_update, status_msg
+
+
+@app.callback(
+    Output("annotation-tags", "children"),
+    Input("annotations-store", "data"),
+    State("selected-loop", "data"),
+    prevent_initial_call=True,
+)
+def update_annotation_tags(annotations_store, selected_idx):
+    if not annotations_store or selected_idx < 0:
+        return []
+
+    loop_key = str(selected_idx)
+    annotations = annotations_store.get(loop_key, [])
+
+    buttons = []
+    for i, ann in enumerate(annotations):
+        buttons.append(
+            dbc.Button(
+                [html.I(className="fas fa-times me-1"), f"标注{i+1}"],
+                id={"type": "delete-annotation", "index": i},
+                size="sm",
+                color="warning",
+                outline=True,
+                className="me-1 mb-1",
+                style={"fontSize": "11px"},
+            )
+        )
+
+    return buttons
+
+
+@app.callback(
+    Output("metrics-history-store", "data"),
+    Output("record-status", "children"),
+    Input("btn-record-metrics", "n_clicks"),
+    Input("btn-clear-history-modal", "n_clicks"),
+    State("metrics-history-store", "data"),
+    State("analysis-store", "data"),
+    State("selected-loop", "data"),
+    State("time-range-store", "data"),
+    prevent_initial_call=True,
+)
+def handle_metrics_history(record_clicks, clear_clicks, history_store, analysis,
+                            selected_idx, time_ranges):
+    ctx = dash.callback_context
+    triggered = ctx.triggered_id
+
+    if selected_idx < 0:
+        return dash.no_update, ""
+
+    history_store = dict(history_store) if history_store else {}
+    loop_key = str(selected_idx)
+    history = history_store.get(loop_key, [])
+
+    if triggered == "btn-clear-history-modal":
+        if clear_clicks is None or clear_clicks == 0:
+            return dash.no_update, ""
+        history_store[loop_key] = []
+        return history_store, "历史记录已清空"
+
+    if triggered == "btn-record-metrics":
+        if record_clicks is None or record_clicks == 0:
+            return dash.no_update, ""
+        if not analysis or "metrics" not in analysis:
+            return dash.no_update, "暂无指标数据可记录"
+
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        time_range = time_ranges.get(loop_key, {}) if time_ranges else {}
+        if time_range and "x" in time_range:
+            range_desc = f"{time_range['x'][0]:.1f}s - {time_range['x'][1]:.1f}s"
+        else:
+            range_desc = "全部数据"
+
+        record = {
+            "timestamp": timestamp,
+            "metrics": analysis["metrics"],
+            "harris": analysis.get("harris", {}),
+            "range": range_desc,
+        }
+
+        history.append(record)
+
+        if len(history) > 10:
+            history = history[-10:]
+
+        history_store[loop_key] = history
+
+        return history_store, f"已记录快照 #{len(history)} ({timestamp})"
+
+    return dash.no_update, ""
+
+
+def _build_history_content(history_store, selected_idx):
+    if selected_idx < 0 or not history_store:
+        return html.P("暂无历史记录，请先点击\"记录当前指标\"保存快照", className="text-muted")
+
+    loop_key = str(selected_idx)
+    history = history_store.get(loop_key, [])
+
+    if not history:
+        return html.P("暂无历史记录，请先点击\"记录当前指标\"保存快照", className="text-muted")
+
+    metric_names = ["IAE", "ISE", "ITAE", "overshoot_pct", "settling_time",
+                    "steady_state_error", "oscillation_period", "decay_ratio"]
+    metric_labels = {
+        "IAE": "IAE",
+        "ISE": "ISE",
+        "ITAE": "ITAE",
+        "overshoot_pct": "过冲量(%)",
+        "settling_time": "调节时间(s)",
+        "steady_state_error": "稳态误差",
+        "oscillation_period": "振荡周期(s)",
+        "decay_ratio": "衰减比",
+    }
+
+    timestamps = [h["timestamp"] for h in history]
+
+    figs = []
+    for metric in metric_names:
+        values = [h["metrics"].get(metric, 0) for h in history]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=values,
+            mode="lines+markers",
+            name=metric_labels[metric],
+            line=dict(color=COLORS["accent"], width=2),
+            marker=dict(size=6),
+        ))
+        fig.update_layout(
+            title=dict(text=metric_labels[metric], font=dict(color="white", size=12)),
+            paper_bgcolor="#0a1628",
+            plot_bgcolor="#0a1628",
+            font=dict(color="#ccc", size=10),
+            height=200,
+            margin=dict(l=50, r=20, t=30, b=40),
+            xaxis=dict(gridcolor="#333", tickangle=30, tickfont=dict(size=9)),
+            yaxis=dict(gridcolor="#333"),
+            showlegend=False,
+        )
+        figs.append(dbc.Col(dcc.Graph(figure=fig, config={"displayModeBar": False}),
+                            width=4, className="mb-3"))
+
+    table_rows = []
+    table_rows.append(html.Tr(
+        [html.Th("时间", className="text-warning small p-2")] +
+        [html.Th(metric_labels[m], className="text-warning small p-2 text-center") for m in metric_names]
+    ))
+
+    for i, h in enumerate(history):
+        row = [html.Td(h["timestamp"], className="text-light small p-2")]
+        for m in metric_names:
+            val = h["metrics"].get(m, "N/A")
+            if isinstance(val, float):
+                val_str = f"{val:.4f}"
+            else:
+                val_str = str(val)
+
+            if i > 0:
+                prev_val = history[i-1]["metrics"].get(m, 0)
+                if prev_val and prev_val != 0 and not (isinstance(prev_val, float) and np.isnan(prev_val)):
+                    change = (val - prev_val) / abs(prev_val) * 100
+                    if abs(change) > 10:
+                        color = COLORS["red"]
+                        arrow = "↑" if change > 0 else "↓"
+                        val_str = f"{val_str} {arrow}"
+                        row.append(html.Td(val_str, className="text-white small p-2 text-center",
+                                           style={"color": color, "fontWeight": "bold"}))
+                    else:
+                        row.append(html.Td(val_str, className="text-white small p-2 text-center"))
+                else:
+                    row.append(html.Td(val_str, className="text-white small p-2 text-center"))
+            else:
+                row.append(html.Td(val_str, className="text-white small p-2 text-center"))
+        table_rows.append(html.Tr(row))
+
+    history_table = html.Table(
+        table_rows,
+        className="w-100 table table-dark table-striped",
+        style={"fontSize": "11px", "borderCollapse": "collapse"}
+    )
+
+    content = html.Div([
+        html.H6("指标变化趋势", className="text-white mb-3"),
+        dbc.Row(figs),
+        html.Hr(className="my-4", style={"borderColor": "#333"}),
+        html.H6("历史记录详情", className="text-white mb-2"),
+        html.Div(className="table-responsive", children=[history_table]),
+    ])
+
+    return content
+
+
+@app.callback(
+    Output("history-modal", "is_open"),
+    Output("history-modal-body", "children"),
+    Input("btn-view-history", "n_clicks"),
+    Input("btn-close-history", "n_clicks"),
+    State("metrics-history-store", "data"),
+    State("selected-loop", "data"),
+    State("history-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_history_modal(view_clicks, close_clicks, history_store, selected_idx, is_open):
+    ctx = dash.callback_context
+    triggered = ctx.triggered_id
+
+    if triggered == "btn-close-history":
+        if close_clicks is None or close_clicks == 0:
+            return dash.no_update, dash.no_update
+        return False, []
+
+    if triggered == "btn-view-history":
+        if view_clicks is None or view_clicks == 0:
+            return dash.no_update, dash.no_update
+        if is_open:
+            return False, []
+        else:
+            content = _build_history_content(history_store, selected_idx)
+            return True, content
+
+    return dash.no_update, dash.no_update
+
+
+@app.callback(
+    Output("history-modal-body", "children", allow_duplicate=True),
+    Input("metrics-history-store", "data"),
+    State("selected-loop", "data"),
+    State("history-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def update_history_modal_content(history_store, selected_idx, is_open):
+    if not is_open:
+        return dash.no_update
+    return _build_history_content(history_store, selected_idx)
 
 
 if __name__ == "__main__":
