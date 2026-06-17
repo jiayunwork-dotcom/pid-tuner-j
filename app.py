@@ -516,6 +516,34 @@ def _alert_rules_panel(rules):
                            id="btn-add-rule", color="success", size="sm"),
             ], className="d-flex justify-content-between align-items-center mb-3"),
             html.Div(id="alert-rules-list", children=rule_cards),
+            html.Hr(style={"borderColor": "#333"}),
+            html.Div([
+                html.Small("添加新规则", className="text-white fw-bold mb-2 d-block"),
+                dbc.Input(id="alert-rule-name-input", placeholder="规则名称", size="sm", className="mb-2"),
+                dbc.Select(id="alert-rule-metric-select", options=[
+                    {"label": "Harris指标", "value": "harris_index"},
+                    {"label": "振荡幅度(%)", "value": "osc_amplitude_pct"},
+                    {"label": "粘滞程度", "value": "stiction_severity"},
+                    {"label": "过冲量(%)", "value": "overshoot_pct"},
+                    {"label": "稳态误差", "value": "steady_state_error"},
+                ], value="harris_index", size="sm", className="mb-2"),
+                dbc.Select(id="alert-rule-condition-select", options=[
+                    {"label": "大于", "value": "gt"},
+                    {"label": "小于", "value": "lt"},
+                    {"label": "等于", "value": "eq"},
+                    {"label": "偏离均值超过10%", "value": "deviation_10"},
+                    {"label": "偏离均值超过20%", "value": "deviation_20"},
+                    {"label": "偏离均值超过50%", "value": "deviation_50"},
+                ], value="gt", size="sm", className="mb-2"),
+                dbc.Input(id="alert-rule-threshold-input", type="number", placeholder="阈值", size="sm", className="mb-2"),
+                dbc.Select(id="alert-rule-severity-select", options=[
+                    {"label": "信息", "value": "信息"},
+                    {"label": "警告", "value": "警告"},
+                    {"label": "严重", "value": "严重"},
+                    {"label": "紧急", "value": "紧急"},
+                ], value="信息", size="sm", className="mb-2"),
+                dbc.Button("添加规则", id="alert-rule-add-btn", color="primary", size="sm", className="w-100"),
+            ]),
         ]),
     ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
 
@@ -547,8 +575,8 @@ def _build_alert_rule_card(rule):
                         value=[rule_id] if enabled else [],
                         id={"type": "rule-enable-check", "index": rule_id},
                         className="d-inline-block me-2",
-                        input_class_name="form-check-input",
-                        label_class_name="form-check-label",
+                        inputClassName="form-check-input",
+                        labelClassName="form-check-label",
                     ),
                     html.Strong(rule.get("name", "未命名规则"), className="text-white"),
                 ]),
@@ -870,7 +898,7 @@ def _compute_loop_health_score(loop):
         return 50.0
 
 
-def _evaluate_single_loop(loop, loop_idx, rules):
+def _evaluate_single_loop(loop, loop_idx, rules, metric_means=None):
     pv = np.array(loop["pv"])
     sp = np.array(loop["sp"])
     co = np.array(loop["co"])
@@ -904,7 +932,7 @@ def _evaluate_single_loop(loop, loop_idx, rules):
     for rule in rules:
         if not rule.get("enabled", True):
             continue
-        if _match_rule(loop_metrics, rule):
+        if _match_rule(loop_metrics, rule, metric_means):
             cur_val = _format_metric_value(loop_metrics, rule["metric"])
             alerts.append({
                 "timestamp": ts_now,
@@ -934,7 +962,7 @@ def _format_metric_value(loop_metrics, metric):
     return str(v)
 
 
-def _match_rule(loop_metrics, rule):
+def _match_rule(loop_metrics, rule, metric_means=None):
     metric = rule["metric"]
     condition = rule["condition"]
     threshold = rule["threshold"]
@@ -953,8 +981,12 @@ def _match_rule(loop_metrics, rule):
         elif condition == "deviation":
             threshold_pct = float(threshold)
             if isinstance(value, (int, float)):
-                mean_val = value
-                deviation_pct = abs(value - mean_val) / max(abs(mean_val), 1e-6) * 100
+                mean_val = None
+                if metric_means and metric in metric_means:
+                    mean_val = metric_means[metric]
+                if mean_val is None or mean_val == 0:
+                    return False
+                deviation_pct = abs(float(value) - float(mean_val)) / abs(float(mean_val)) * 100
                 return deviation_pct > threshold_pct
             return False
     except (ValueError, TypeError):
@@ -2685,11 +2717,11 @@ def update_history_modal_content(history_store, selected_idx, is_open):
     Output("inspection-interval", "disabled"),
     Output("inspection-interval", "interval"),
     Output("inspection-status-store", "data"),
-    Output("inspection-start-btn", "disabled"),
-    Output("inspection-stop-btn", "disabled"),
-    Input("inspection-start-btn", "n_clicks"),
-    Input("inspection-stop-btn", "n_clicks"),
-    Input("inspection-run-once-btn", "n_clicks"),
+    Output("btn-start-inspection", "disabled"),
+    Output("btn-stop-inspection", "disabled"),
+    Input("btn-start-inspection", "n_clicks"),
+    Input("btn-stop-inspection", "n_clicks"),
+    Input("btn-run-once", "n_clicks"),
     State("inspection-interval-input", "value"),
     State("loops-store", "data"),
     State("inspection-status-store", "data"),
@@ -2702,11 +2734,11 @@ def toggle_inspection(start_clicks, stop_clicks, run_once_clicks, interval_sec, 
     interval_ms = max(5, int(interval_sec if interval_sec else 60)) * 1000
     total = len(loops) if loops else 0
 
-    if triggered == "inspection-stop-btn":
+    if triggered == "btn-stop-inspection":
         new_status = {"running": False, "current_idx": 0, "total": total, "current_name": ""}
         return True, interval_ms, new_status, False, True
 
-    if triggered == "inspection-start-btn":
+    if triggered == "btn-start-inspection":
         if start_clicks is None or start_clicks == 0:
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         if not loops or len(loops) == 0:
@@ -2714,21 +2746,21 @@ def toggle_inspection(start_clicks, stop_clicks, run_once_clicks, interval_sec, 
         new_status = {"running": True, "current_idx": 0, "total": total, "current_name": loops[0]["name"] if total > 0 else ""}
         return False, interval_ms, new_status, True, False
 
-    if triggered == "inspection-run-once-btn":
+    if triggered == "btn-run-once":
         if run_once_clicks is None or run_once_clicks == 0:
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         if not loops or len(loops) == 0:
             return True, interval_ms, status, False, True
         new_status = {"running": True, "current_idx": 0, "total": total,
                      "current_name": loops[0]["name"] if total > 0 else "", "run_once": True}
-        return True, interval_ms, new_status, True, True
+        return False, 1000, new_status, True, True
 
     return dash.no_update, interval_ms, dash.no_update, dash.no_update, dash.no_update
 
 
 @app.callback(
-    Output("inspection-progress-label", "children"),
-    Output("inspection-progress-bar", "value"),
+    Output("inspection-progress-text", "children"),
+    Output("inspection-progress", "value"),
     Input("inspection-status-store", "data"),
     prevent_initial_call=True,
 )
@@ -2775,8 +2807,21 @@ def run_full_inspection(n_intervals, loops, rules, history, alert_records, statu
     loop_results = []
     new_alerts = []
 
+    all_loop_metrics = []
     for i, loop in enumerate(loops):
-        result = _evaluate_single_loop(i, loop, rules)
+        result = _evaluate_single_loop(loop, i, rules)
+        all_loop_metrics.append(result["metrics"])
+
+    numeric_keys = ["harris_index", "harris_improvement", "osc_amplitude_pct",
+                    "overshoot_pct", "steady_state_error"]
+    metric_means = {}
+    for key in numeric_keys:
+        vals = [m[key] for m in all_loop_metrics if key in m and isinstance(m[key], (int, float))]
+        if vals:
+            metric_means[key] = sum(vals) / len(vals)
+
+    for i, loop in enumerate(loops):
+        result = _evaluate_single_loop(loop, i, rules, metric_means)
         loop_results.append({
             "loop_idx": i,
             "loop_name": loop["name"],
@@ -2850,29 +2895,37 @@ def run_full_inspection(n_intervals, loops, rules, history, alert_records, statu
 
 
 @app.callback(
-    Output({"type": "alert-rule-enable-switch", "index": MATCH}, "checked"),
     Output("alert-rules-store", "data", allow_duplicate=True),
-    Input({"type": "alert-rule-enable-switch", "index": MATCH}, "value"),
-    State({"type": "alert-rule-enable-switch", "index": MATCH}, "checked"),
+    Input({"type": "rule-enable-check", "index": ALL}, "value"),
+    State({"type": "rule-enable-check", "index": ALL}, "id"),
     State("alert-rules-store", "data"),
     prevent_initial_call=True,
 )
-def toggle_alert_rule(switch_value, is_checked, rules):
+def toggle_alert_rule(all_values, all_ids, rules):
     ctx_cb = dash.callback_context
-    triggered = ctx_cb.triggered_id
-    if not triggered:
-        return dash.no_update, dash.no_update
-    try:
-        idx = json.loads(triggered.split(".")[0])["index"]
-    except (json.JSONDecodeError, KeyError):
-        return dash.no_update, dash.no_update
+    if not ctx_cb.triggered:
+        return dash.no_update
 
+    triggered_prop = ctx_cb.triggered[0]["prop_id"]
     new_rules = list(rules) if rules else []
-    for r in new_rules:
-        if r.get("id") == idx:
-            r["enabled"] = is_checked if is_checked is not None else (not r["enabled"])
+
+    try:
+        triggered_id_str = triggered_prop.split(".")[0]
+        triggered_id_dict = json.loads(triggered_id_str)
+        triggered_rule_id = triggered_id_dict.get("index", "")
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return dash.no_update
+
+    for idx, comp_id in enumerate(all_ids):
+        if comp_id.get("index") == triggered_rule_id and idx < len(all_values):
+            is_enabled = len(all_values[idx]) > 0
+            for r in new_rules:
+                if r.get("id") == triggered_rule_id:
+                    r["enabled"] = is_enabled
+                    break
             break
-    return (r["enabled"] if r.get("id") == idx else dash.no_update), new_rules
+
+    return new_rules
 
 
 @app.callback(
@@ -2900,12 +2953,20 @@ def add_alert_rule(add_clicks, name, metric, condition, threshold, severity, rul
 
     new_rules = list(rules) if rules else []
     rule_id = f"rule-{int(time.time())}"
+
+    actual_condition = condition
+    actual_threshold = threshold
+    if condition.startswith("deviation_"):
+        actual_condition = "deviation"
+        pct = condition.replace("deviation_", "")
+        actual_threshold = float(pct)
+
     new_rules.append({
         "id": rule_id,
         "name": name,
         "metric": metric,
-        "condition": condition,
-        "threshold": threshold,
+        "condition": actual_condition,
+        "threshold": actual_threshold,
         "severity": severity,
         "enabled": True,
     })
@@ -2914,7 +2975,7 @@ def add_alert_rule(add_clicks, name, metric, condition, threshold, severity, rul
 
 @app.callback(
     Output("alert-rules-store", "data", allow_duplicate=True),
-    Input({"type": "alert-rule-delete-btn", "index": ALL}, "n_clicks"),
+    Input({"type": "rule-delete-btn", "index": ALL}, "n_clicks"),
     State("alert-rules-store", "data"),
     prevent_initial_call=True,
 )
@@ -2986,23 +3047,18 @@ def jump_from_alert(clicks, alert_records, severity_filter, search_text):
         return dash.no_update, dash.no_update, dash.no_update
 
     try:
-        alert_idx_str = json.loads(triggered.split(".")[0])["index"]
-        alert_idx = int(alert_idx_str)
+        loop_idx_str = json.loads(triggered.split(".")[0])["index"]
+        loop_idx = int(loop_idx_str)
     except (json.JSONDecodeError, KeyError, ValueError):
         return dash.no_update, dash.no_update, dash.no_update
 
-    filtered = _filter_alerts(alert_records, severity_filter, search_text)
-    if 0 <= alert_idx < len(filtered):
-        loop_idx = filtered[alert_idx].get("loop_idx", 0)
-        return loop_idx, "tab-analysis", "tab-analysis"
-
-    return dash.no_update, dash.no_update, dash.no_update
+    return loop_idx, "tab-analysis", "tab-analysis"
 
 
 @app.callback(
     Output("alert-trend-chart", "figure"),
     Output("alert-loop-rank-chart", "figure"),
-    Output("alert-severity-pie", "figure"),
+    Output("alert-severity-pie-chart", "figure"),
     Input("alert-records-store", "data"),
     prevent_initial_call=True,
 )
@@ -3014,9 +3070,9 @@ def update_alert_charts(alert_records):
 
 
 @app.callback(
-    Output("inspection-summary-content", "is_open"),
-    Input("inspection-summary-header", "n_clicks"),
-    State("inspection-summary-content", "is_open"),
+    Output("summary-collapse", "is_open"),
+    Input("btn-toggle-summary", "n_clicks"),
+    State("summary-collapse", "is_open"),
     prevent_initial_call=True,
 )
 def toggle_summary_collapse(n_clicks, is_open):
@@ -3027,7 +3083,7 @@ def toggle_summary_collapse(n_clicks, is_open):
 
 @app.callback(
     Output("download-inspection-csv", "data"),
-    Input("inspection-export-btn", "n_clicks"),
+    Input("btn-export-inspection-csv", "n_clicks"),
     State("inspection-history-store", "data"),
     prevent_initial_call=True,
 )
@@ -3107,7 +3163,7 @@ def export_inspection_csv(n_clicks, history):
 
 
 @app.callback(
-    Output("inspection-summary-body", "children"),
+    Output("inspection-summary-content", "children"),
     Input("inspection-history-store", "data"),
     prevent_initial_call=True,
 )
