@@ -20,6 +20,10 @@ from utils.model_id import identify_fopdt, relay_feedback_identify
 from utils.pid_tuning import compute_pid_recommendations, format_tuning_table
 from utils.simulation import simulate_closed_loop
 from utils.report import generate_report
+from utils.degradation import (
+    analyze_all_loops, analyze_loop_degradation,
+    generate_maintenance_suggestions, get_degradation_arrow
+)
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY],
                 suppress_callback_exceptions=True)
@@ -218,6 +222,12 @@ app.layout = dbc.Container(fluid=True, style={
                                  selected_style={"backgroundColor": COLORS["bg"], "color": COLORS["accent"],
                                                   "borderTop": f"3px solid {COLORS['accent']}", "padding": "10px 20px"},
                                  className="custom-tab"),
+                         dcc.Tab(label="预测性维护", value="tab-prediction",
+                                 style={"backgroundColor": COLORS["panel"], "color": "#ccc",
+                                        "border": "none", "padding": "10px 20px"},
+                                 selected_style={"backgroundColor": COLORS["bg"], "color": COLORS["accent"],
+                                                  "borderTop": f"3px solid {COLORS['accent']}", "padding": "10px 20px"},
+                                 className="custom-tab"),
                      ]),
             html.Div(id="tab-content", style={
                 "backgroundColor": COLORS["bg"],
@@ -247,6 +257,10 @@ app.layout = dbc.Container(fluid=True, style={
     dcc.Store(id="alert-confirm-store", data={}),
     dcc.Store(id="silence-rules-store", data=[]),
     dcc.Store(id="health-trend-selected-store", data=[]),
+    dcc.Store(id="degradation-analysis-store", data=[]),
+    dcc.Store(id="maintenance-suggestions-store", data={}),
+    dcc.Store(id="selected-prediction-loop", data=-1),
+    dcc.Store(id="predictive-alerts-store", data=[]),
 
     dbc.Modal([
         dbc.ModalHeader(dbc.ModalTitle("多回路性能指标对比")),
@@ -326,18 +340,27 @@ def store_active_tab(tab_value):
     Input("alert-confirm-store", "data"),
     Input("silence-rules-store", "data"),
     Input("health-trend-selected-store", "data"),
+    Input("degradation-analysis-store", "data"),
+    Input("maintenance-suggestions-store", "data"),
+    Input("selected-prediction-loop", "data"),
+    Input("predictive-alerts-store", "data"),
     State("loops-store", "data"),
 )
 def render_tab_content(tab_value, selected, time_ranges, annotations_store, pending_annotation,
                        metrics_history, inspection_history, alert_records, alert_rules,
-                       inspection_status, alert_confirms, silence_rules, trend_selected, loops):
+                       inspection_status, alert_confirms, silence_rules, trend_selected,
+                       degradation_analysis, maintenance_suggestions, selected_pred_loop,
+                       predictive_alerts, loops):
     if tab_value == "tab-analysis":
         return _render_analysis_tab(selected, time_ranges, annotations_store, pending_annotation,
                                      metrics_history, loops)
-    else:
+    elif tab_value == "tab-inspection":
         return _render_inspection_tab(inspection_history, alert_records, alert_rules,
                                        inspection_status, loops, alert_confirms, silence_rules,
-                                       trend_selected)
+                                       trend_selected, predictive_alerts)
+    else:
+        return _render_prediction_tab(degradation_analysis, maintenance_suggestions,
+                                       selected_pred_loop, loops, inspection_history)
 
 
 def _render_analysis_tab(selected, time_ranges, annotations_store, pending_annotation,
@@ -426,15 +449,15 @@ def _render_analysis_tab(selected, time_ranges, annotations_store, pending_annot
 
 def _render_inspection_tab(inspection_history, alert_records, alert_rules,
                             inspection_status, loops, alert_confirms, silence_rules,
-                            trend_selected):
+                            trend_selected, predictive_alerts=None):
     return html.Div([
         _inspection_config_panel(inspection_status),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
-        _inspection_summary_panel(inspection_history),
+        _inspection_summary_panel(inspection_history, predictive_alerts),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
         dbc.Row([
             dbc.Col(_alert_rules_panel(alert_rules), width=4),
-            dbc.Col(_alert_display_panel(alert_records, loops, alert_confirms, silence_rules), width=8),
+            dbc.Col(_alert_display_panel(alert_records, loops, alert_confirms, silence_rules, predictive_alerts), width=8),
         ]),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
         _health_trend_panel(inspection_history, loops, trend_selected),
@@ -493,7 +516,7 @@ def _inspection_config_panel(status):
     ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
 
 
-def _inspection_summary_panel(inspection_history):
+def _inspection_summary_panel(inspection_history, predictive_alerts=None):
     summary_content = html.P("暂无巡检数据，请启动巡检或立即执行一次",
                              className="text-muted text-center py-4")
 
@@ -536,6 +559,24 @@ def _inspection_summary_panel(inspection_history):
                                  "animation": "alertBlink 1.2s ease-in-out infinite"}),
             ], className="mt-2")
 
+        predictive_section = ""
+        if predictive_alerts and len(predictive_alerts) > 0:
+            pred_items = []
+            for pa in predictive_alerts[:3]:
+                pred_items.append(html.Li([
+                    html.I(className="fas fa-crystal-ball text-info me-1"),
+                    html.Span(f"{pa.get('loop_name', '')} ", className="text-white small"),
+                    html.Span(pa.get('current_value', ''), className="text-warning small"),
+                ], className="mb-1"))
+            predictive_section = html.Div([
+                html.H6("预测性告警 (劣化趋势预警)", className="text-info small mb-2 fw-bold"),
+                html.Ul(pred_items, className="mb-0 ps-3"),
+            ], className="mt-3 p-2", style={
+                "backgroundColor": "rgba(52, 152, 219, 0.1)",
+                "borderLeft": f"3px solid {SEVERITY_COLORS.get('信息', '#3498db')}",
+                "borderRadius": "4px",
+            })
+
         summary_content = html.Div([
             html.Div([
                 html.Div([
@@ -551,6 +592,7 @@ def _inspection_summary_panel(inspection_history):
                 html.H6("最差回路 TOP3 (按健康评分)", className="text-warning small mb-2 fw-bold"),
                 html.Ul(worst_items, className="mb-0 ps-3"),
             ]),
+            predictive_section,
         ])
 
     compare_disabled = not (inspection_history and len(inspection_history) >= 2)
@@ -677,8 +719,12 @@ def _build_alert_rule_card(rule):
     ], style={"backgroundColor": COLORS["card"], "marginBottom": "6px", "border": "1px solid #333"})
 
 
-def _alert_display_panel(alert_records, loops, alert_confirms, silence_rules):
-    filtered_alerts = _filter_alerts(alert_records, "all", "", alert_confirms)
+def _alert_display_panel(alert_records, loops, alert_confirms, silence_rules, predictive_alerts=None):
+    all_alerts = list(alert_records) if alert_records else []
+    if predictive_alerts:
+        all_alerts = all_alerts + predictive_alerts
+
+    filtered_alerts = _filter_alerts(all_alerts, "all", "", alert_confirms)
 
     alert_items = []
     if filtered_alerts:
@@ -837,12 +883,16 @@ def _build_alert_item(alert, alert_confirms=None):
     loop_idx = alert.get("loop_idx", -1)
     is_confirmed = _is_alert_confirmed(alert, alert_confirms) if alert_confirms else False
     is_escalated = alert.get("escalated", False)
+    is_predictive = alert.get("is_predictive", False)
     alert_key = _alert_key(alert)
 
     bg_color = "#2a2a3e" if is_confirmed else COLORS["card"]
+    if is_predictive and not is_confirmed:
+        bg_color = "rgba(52, 152, 219, 0.1)"
+
     blink_class = "alert-escalated-blink" if is_escalated and not is_confirmed else ""
-    status_text = "已确认" if is_confirmed else "活跃"
-    status_color = "#888" if is_confirmed else COLORS["green"]
+    status_text = "已确认" if is_confirmed else ("预测" if is_predictive else "活跃")
+    status_color = "#888" if is_confirmed else ("#3498db" if is_predictive else COLORS["green"])
 
     confirm_btn = dbc.Button(
         [html.I(className="fas fa-check me-1"), "确认" if not is_confirmed else "已确认"],
@@ -852,6 +902,8 @@ def _build_alert_item(alert, alert_confirms=None):
         id={"type": "alert-confirm-btn", "index": alert_key},
         style={"fontSize": "10px", "padding": "2px 6px"},
     )
+    if is_predictive:
+        confirm_btn = ""
 
     escalation_badge = ""
     if is_escalated and not is_confirmed:
@@ -860,6 +912,11 @@ def _build_alert_item(alert, alert_confirms=None):
                                             "fontSize": "9px",
                                             "animation": "alertBlink 1.2s ease-in-out infinite"})
 
+    predictive_badge = ""
+    if is_predictive:
+        predictive_badge = html.Span("预测", className="badge ms-1",
+                                      style={"backgroundColor": "#3498db", "fontSize": "9px"})
+
     return dbc.Card([
         dbc.CardBody([
             html.Div([
@@ -867,6 +924,7 @@ def _build_alert_item(alert, alert_confirms=None):
                     html.Span(sev, className="badge me-2",
                               style={"backgroundColor": sev_color, "fontSize": "10px"}),
                     escalation_badge,
+                    predictive_badge,
                     html.Span(alert.get("loop_name", "未知回路"), className="text-white fw-bold small"),
                     html.Span(f" [{status_text}]", className="small ms-1",
                               style={"color": status_color, "fontSize": "10px"}),
@@ -3655,6 +3713,393 @@ def _health_trend_panel(inspection_history, loops, trend_selected):
     ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
 
 
+def _render_prediction_tab(degradation_analysis, maintenance_suggestions,
+                            selected_pred_loop, loops, inspection_history):
+    if not loops or len(loops) == 0:
+        return html.Div(className="text-center mt-5", children=[
+            html.I(className="fas fa-chart-line fa-4x mb-3", style={"color": COLORS["accent"]}),
+            html.H4("预测性维护与劣化趋势分析", className="text-white"),
+            html.P("请先添加控制回路并启动巡检", className="text-muted"),
+        ])
+
+    if not inspection_history or len(inspection_history) < 3:
+        return html.Div(className="text-center mt-5", children=[
+            html.I(className="fas fa-hourglass-half fa-4x mb-3", style={"color": COLORS["yellow"]}),
+            html.H4("正在积累巡检数据", className="text-white"),
+            html.P("至少需要3轮巡检数据才能进行劣化趋势分析", className="text-muted"),
+            html.P(f"当前已有 {len(inspection_history)} 轮数据", className="text-info small mt-2"),
+        ])
+
+    selected_analysis = None
+    selected_suggestions = []
+    if selected_pred_loop is not None and selected_pred_loop >= 0 and degradation_analysis:
+        for da in degradation_analysis:
+            if da.get("loop_idx") == selected_pred_loop:
+                selected_analysis = da
+                break
+        if selected_analysis:
+            sugg_key = str(selected_pred_loop)
+            selected_suggestions = maintenance_suggestions.get(sugg_key, []) if maintenance_suggestions else []
+
+    return html.Div([
+        _degradation_overview_cards(degradation_analysis, selected_pred_loop),
+        html.Hr(className="my-3", style={"borderColor": "#333"}),
+        _degradation_detail_section(selected_analysis, selected_suggestions, selected_pred_loop),
+    ])
+
+
+def _degradation_overview_cards(degradation_analysis, selected_loop):
+    if not degradation_analysis or len(degradation_analysis) == 0:
+        return dbc.Card([
+            dbc.CardBody([
+                html.H6("劣化概览", className="text-white mb-0"),
+                html.P("暂无劣化分析数据", className="text-muted text-center py-4"),
+            ]),
+        ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
+
+    card_cols = []
+    for da in degradation_analysis:
+        loop_idx = da.get("loop_idx", -1)
+        loop_name = da.get("loop_name", "未知")
+        health_model = da.get("health_model", {})
+        current_score = health_model.get("current_value", 0)
+        slope = health_model.get("slope", 0)
+        r_squared = health_model.get("r_squared", 0)
+        is_significant = da.get("is_significant", False)
+        warning_rounds = da.get("warning_rounds")
+
+        arrow = get_degradation_arrow(slope, r_squared)
+
+        if is_significant:
+            border_color = COLORS["red"]
+            left_bar_color = COLORS["red"]
+        else:
+            border_color = COLORS["green"]
+            left_bar_color = COLORS["green"]
+
+        is_selected = selected_loop == loop_idx
+        card_bg = COLORS["card"] if not is_selected else COLORS["accent"]
+
+        warning_text = "稳定"
+        if warning_rounds is not None:
+            warning_text = f"预计 {warning_rounds:.1f} 轮后达警戒线"
+        elif is_significant:
+            warning_text = "劣化趋势中"
+
+        if current_score >= 80:
+            score_color = COLORS["green"]
+        elif current_score >= 60:
+            score_color = COLORS["yellow"]
+        else:
+            score_color = COLORS["red"]
+
+        card = dbc.Card([
+            dbc.CardBody([
+                html.Div([
+                    html.Div([
+                        html.Strong(loop_name[:18], className="text-white small"),
+                    ]),
+                    html.Span(f"{current_score:.0f}", className="badge ms-auto",
+                              style={"backgroundColor": score_color, "fontSize": "11px"}),
+                ], className="d-flex align-items-center mb-2"),
+                html.Div([
+                    html.Span("劣化速率: ", className="text-muted small"),
+                    html.Span(
+                        [arrow, f" {abs(slope):.2f}/轮"],
+                        className="small",
+                        style={"color": COLORS["red"] if slope < -0.3 else "#ccc"}
+                    ),
+                ], className="mb-1"),
+                html.Small(warning_text, className="text-info"),
+            ],
+                style={"padding": "8px 10px", "cursor": "pointer"},
+            ),
+        ], id={"type": "prediction-card", "index": loop_idx},
+            style={
+                "backgroundColor": card_bg,
+                "border": f"2px solid {border_color}" if is_selected else f"1px solid #333",
+                "borderLeft": f"4px solid {left_bar_color}",
+                "marginBottom": "8px",
+                "borderRadius": "6px",
+            },
+            className="prediction-card-hover",
+        )
+        card_cols.append(dbc.Col(card, width=3, className="mb-2"))
+
+    return dbc.Card([
+        dbc.CardHeader([
+            html.Div([
+                html.H6("劣化概览", className="text-white mb-0 d-inline-block"),
+                html.Small(" (点击卡片查看详细分析)", className="text-muted ms-2"),
+            ]),
+        ], style={"backgroundColor": COLORS["card"], "border": "none"}),
+        dbc.CardBody([
+            dbc.Row(card_cols, className="g-2"),
+        ]),
+    ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
+
+
+def _degradation_detail_section(selected_analysis, suggestions, selected_loop):
+    if not selected_analysis or selected_loop < 0:
+        return dbc.Card([
+            dbc.CardBody([
+                html.H6("详细分析", className="text-white mb-0"),
+                html.P("请点击上方卡片选择一个回路查看详细分析", className="text-muted text-center py-5"),
+            ]),
+        ], style={"backgroundColor": COLORS["panel"]})
+
+    return dbc.Row([
+        dbc.Col(_health_prediction_chart(selected_analysis), width=6),
+        dbc.Col([
+            _submetrics_radar_chart(selected_analysis),
+            html.Div(style={"height": "10px"}),
+            _maintenance_suggestions_list(suggestions, selected_loop),
+        ], width=6),
+    ])
+
+
+def _health_prediction_chart(analysis):
+    sequences = analysis.get("sequences", {})
+    health_scores = sequences.get("health_score", [])
+    health_model = analysis.get("health_model", {})
+    warning_threshold = analysis.get("warning_threshold", 60)
+    danger_threshold = analysis.get("danger_threshold", 40)
+    warning_rounds = analysis.get("warning_rounds")
+    danger_rounds = analysis.get("danger_rounds")
+
+    n_actual = len(health_scores)
+    x_actual = list(range(n_actual))
+
+    slope = health_model.get("slope", 0)
+    intercept = health_model.get("intercept", 0)
+    r_squared = health_model.get("r_squared", 0)
+
+    forecast_rounds = 20
+    if warning_rounds is not None:
+        forecast_rounds = max(20, int(warning_rounds * 1.5) + 5)
+    if danger_rounds is not None:
+        forecast_rounds = max(forecast_rounds, int(danger_rounds * 1.2) + 5)
+
+    x_future = list(range(n_actual - 1, n_actual + forecast_rounds))
+    y_fit_future = [slope * x + intercept for x in x_future]
+
+    y_fit_actual = [slope * x + intercept for x in x_actual]
+
+    residual_std = 0
+    if len(health_scores) > 2:
+        residuals = [health_scores[i] - y_fit_actual[i] for i in range(n_actual)]
+        residual_std = float(np.std(residuals)) if len(residuals) > 0 else 0
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=x_actual, y=health_scores,
+        mode="lines+markers", name="实际评分",
+        line=dict(color=COLORS["pv"], width=2),
+        marker=dict(size=6),
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=x_actual + x_future,
+        y=y_fit_actual + y_fit_future,
+        mode="lines", name="线性回归预测",
+        line=dict(color=COLORS["accent"], width=2, dash="dash"),
+    ))
+
+    if residual_std > 0:
+        y_upper = [y + 1.96 * residual_std for y in y_fit_actual + y_fit_future]
+        y_lower = [max(0, y - 1.96 * residual_std) for y in y_fit_actual + y_fit_future]
+        fig.add_trace(go.Scatter(
+            x=x_actual + x_future,
+            y=y_upper,
+            mode="lines", line=dict(color="rgba(255,255,255,0)"),
+            showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=x_actual + x_future,
+            y=y_lower,
+            mode="lines", line=dict(color="rgba(255,255,255,0)"),
+            fill="tonexty",
+            fillcolor="rgba(255,255,255,0.1)",
+            name="95%预测区间",
+        ))
+
+    fig.add_hline(y=warning_threshold, line_dash="dash", line_color=COLORS["yellow"],
+                  annotation_text=f"警戒线 ({warning_threshold})",
+                  annotation_position="right",
+                  annotation_font=dict(color=COLORS["yellow"], size=10))
+
+    fig.add_hline(y=danger_threshold, line_dash="dash", line_color=COLORS["red"],
+                  annotation_text=f"危险线 ({danger_threshold})",
+                  annotation_position="right",
+                  annotation_font=dict(color=COLORS["red"], size=10))
+
+    if warning_rounds is not None and warning_rounds > 0:
+        warn_x = n_actual - 1 + warning_rounds
+        fig.add_vline(x=warn_x, line_dash="dot", line_color=COLORS["yellow"],
+                      annotation_text=f"预计{warning_rounds:.1f}轮后达警戒",
+                      annotation_position="top",
+                      annotation_font=dict(color=COLORS["yellow"], size=9))
+
+    fig.update_layout(
+        title=dict(text=f"{analysis.get('loop_name','')} - 健康评分预测",
+                    font=dict(color="white", size=13)),
+        paper_bgcolor=COLORS["panel"],
+        plot_bgcolor="#0a1628",
+        font=dict(color="#ccc", size=10),
+        height=320,
+        margin=dict(l=50, r=20, t=50, b=40),
+        xaxis=dict(title="巡检轮次", gridcolor="#333"),
+        yaxis=dict(title="健康评分", gridcolor="#333", range=[0, 105]),
+        legend=dict(orientation="h", y=1.12, font=dict(size=9)),
+    )
+
+    slope_text = f"斜率: {slope:.3f}/轮"
+    r2_text = f"R²: {r_squared:.3f}"
+    sig_text = "劣化趋势显著" if analysis.get("is_significant", False) else "趋势不显著"
+
+    return dbc.Card([
+        dbc.CardBody([
+            dcc.Graph(figure=fig, config={"displayModeBar": False}),
+            html.Div([
+                html.Span(slope_text, className="text-info small me-3"),
+                html.Span(r2_text, className="text-warning small me-3"),
+                html.Span(sig_text, className="small",
+                          style={"color": COLORS["red"] if analysis.get("is_significant") else COLORS["green"]}),
+            ], className="mt-2 text-center"),
+        ]),
+    ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
+
+
+def _submetrics_radar_chart(analysis):
+    sub_metrics = analysis.get("sub_metrics", {})
+
+    categories = []
+    values = []
+
+    metric_keys = ["harris_index", "oscillation", "stiction", "health_score"]
+    labels_map = {
+        "harris_index": "Harris指标劣化速率",
+        "oscillation": "振荡加剧速率",
+        "stiction": "粘滞恶化速率",
+        "health_score": "综合评分下降速率",
+    }
+
+    max_val = 0.1
+    for key in metric_keys:
+        if key in sub_metrics:
+            categories.append(labels_map.get(key, key))
+            rate = sub_metrics[key].get("degradation_rate", 0)
+            values.append(max(0, rate))
+            if rate > max_val:
+                max_val = rate
+
+    if max_val < 1:
+        max_val = 1
+
+    normalized = [min(v / max_val * 5, 5) for v in values]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=normalized + [normalized[0]],
+        theta=categories + [categories[0]],
+        fill="toself",
+        fillcolor="rgba(233, 69, 96, 0.4)",
+        line=dict(color=COLORS["accent"], width=2),
+        name="劣化速率",
+        text=[f"{v:.3f}/轮" for v in values] + [f"{values[0]:.3f}/轮"],
+        hoverinfo="text",
+    ))
+
+    fig.update_layout(
+        polar=dict(
+            bgcolor="#0a1628",
+            radialaxis=dict(visible=True, range=[0, 5], gridcolor="#333", linecolor="#333",
+                            showticklabels=False),
+            angularaxis=dict(gridcolor="#333", linecolor="#333",
+                              font=dict(color="#ccc", size=10)),
+        ),
+        paper_bgcolor=COLORS["panel"],
+        font=dict(color="#ccc", size=10),
+        height=280,
+        margin=dict(l=20, r=20, t=40, b=20),
+        title=dict(text="子指标劣化速率雷达图", font=dict(color="white", size=12)),
+        showlegend=False,
+    )
+
+    return dbc.Card([
+        dbc.CardBody([
+            dcc.Graph(figure=fig, config={"displayModeBar": False}),
+        ], style={"padding": "10px"}),
+    ], style={"backgroundColor": COLORS["panel"]})
+
+
+def _maintenance_suggestions_list(suggestions, loop_idx):
+    priority_colors = {
+        "紧急": COLORS["red"],
+        "高": "#e67e22",
+        "中": COLORS["yellow"],
+        "低": COLORS["green"],
+    }
+
+    sugg_items = []
+    if suggestions and len(suggestions) > 0:
+        for i, sugg in enumerate(suggestions):
+            priority = sugg.get("priority", "低")
+            action = sugg.get("action", "")
+            description = sugg.get("description", "")
+            window_hours = sugg.get("maintenance_window_hours")
+
+            window_text = ""
+            if window_hours is not None:
+                if window_hours >= 24:
+                    window_text = f"预计维护窗口: {window_hours/24:.1f} 天"
+                else:
+                    window_text = f"预计维护窗口: {window_hours:.1f} 小时"
+
+            sugg_items.append(dbc.Card([
+                dbc.CardBody([
+                    html.Div([
+                        html.Span(priority, className="badge me-2",
+                                  style={"backgroundColor": priority_colors.get(priority, "#666"),
+                                         "fontSize": "10px"}),
+                        html.Strong(action, className="text-white small"),
+                    ], className="mb-2"),
+                    html.P(description, className="text-light small mb-2",
+                           style={"fontSize": "11px", "lineHeight": "1.4"}),
+                    html.Div([
+                        html.Small(window_text, className="text-info"),
+                    ], className="d-flex justify-content-between align-items-center"),
+                ], style={"padding": "10px"}),
+            ], id={"type": "suggestion-item", "index": f"{loop_idx}-{i}"},
+                style={
+                    "backgroundColor": COLORS["card"],
+                    "marginBottom": "6px",
+                    "borderLeft": f"3px solid {priority_colors.get(priority, '#666')}",
+                    "borderRadius": "4px",
+                }))
+    else:
+        sugg_items = [html.P("暂无维护建议", className="text-muted text-center py-3")]
+
+    return dbc.Card([
+        dbc.CardHeader([
+            html.H6("维护建议", className="text-white mb-0 d-inline-block"),
+            dbc.Button(
+                [html.I(className="fas fa-external-link-alt me-1"), "查看回路详情"],
+                id="prediction-jump-to-analysis",
+                size="sm",
+                color="primary",
+                outline=True,
+                className="float-end",
+                style={"fontSize": "11px"},
+            ),
+        ], style={"backgroundColor": COLORS["card"], "border": "none", "padding": "10px 15px"}),
+        dbc.CardBody([
+            html.Div(sugg_items, style={"maxHeight": "300px", "overflowY": "auto"}),
+        ], style={"padding": "10px"}),
+    ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
+
+
 @app.callback(
     Output("alert-confirm-store", "data"),
     Input({"type": "alert-confirm-btn", "index": ALL}, "n_clicks"),
@@ -3895,6 +4340,148 @@ def toggle_compare_rounds_modal(open_clicks, close_clicks, history, is_open):
 )
 def update_trend_selected(selected_loops):
     return selected_loops or []
+
+
+@app.callback(
+    Output("degradation-analysis-store", "data"),
+    Output("maintenance-suggestions-store", "data"),
+    Input("inspection-history-store", "data"),
+    State("loops-store", "data"),
+    State("inspection-interval-input", "value"),
+)
+def compute_degradation_analysis(inspection_history, loops, inspection_interval):
+    if not inspection_history or len(inspection_history) < 3 or not loops:
+        return [], {}
+
+    try:
+        interval_sec = float(inspection_interval) if inspection_interval else 60.0
+    except (ValueError, TypeError):
+        interval_sec = 60.0
+
+    analysis_results = analyze_all_loops(inspection_history, loops)
+
+    suggestions_map = {}
+    for da in analysis_results:
+        loop_idx = da.get("loop_idx", -1)
+        suggestions = generate_maintenance_suggestions(da, interval_sec)
+        suggestions_map[str(loop_idx)] = suggestions
+
+    return analysis_results, suggestions_map
+
+
+@app.callback(
+    Output("selected-prediction-loop", "data"),
+    Input({"type": "prediction-card", "index": ALL}, "n_clicks"),
+    State("selected-prediction-loop", "data"),
+    State("degradation-analysis-store", "data"),
+    prevent_initial_call=True,
+)
+def select_prediction_loop(clicks, current_selected, degradation_analysis):
+    if not clicks or not degradation_analysis:
+        return dash.no_update
+
+    ctx_cb = callback_context
+    if not ctx_cb.triggered:
+        return dash.no_update
+
+    triggered_id = ctx_cb.triggered_id
+    if not isinstance(triggered_id, dict):
+        return dash.no_update
+
+    loop_idx = triggered_id.get("index", -1)
+    trigger_idx = None
+    for i, c in enumerate(clicks):
+        if c:
+            trigger_idx = i
+            break
+
+    if trigger_idx is None:
+        return dash.no_update
+
+    for i, da in enumerate(degradation_analysis):
+        if i == trigger_idx:
+            return da.get("loop_idx", -1)
+
+    return dash.no_update
+
+
+@app.callback(
+    Output("main-tabs", "value", allow_duplicate=True),
+    Output("selected-loop", "data", allow_duplicate=True),
+    Input("prediction-jump-to-analysis", "n_clicks"),
+    State("selected-prediction-loop", "data"),
+    prevent_initial_call=True,
+)
+def jump_from_prediction_to_analysis(n_clicks, selected_pred_loop):
+    if not n_clicks or selected_pred_loop is None or selected_pred_loop < 0:
+        return dash.no_update, dash.no_update
+
+    return "tab-analysis", selected_pred_loop
+
+
+@app.callback(
+    Output("main-tabs", "value", allow_duplicate=True),
+    Output("selected-loop", "data", allow_duplicate=True),
+    Input({"type": "alert-jump-btn", "index": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def jump_from_alert_to_analysis(alert_clicks):
+    if not alert_clicks or all(c is None or c == 0 for c in alert_clicks):
+        return dash.no_update, dash.no_update
+
+    ctx_cb = callback_context
+    if not ctx_cb.triggered:
+        return dash.no_update, dash.no_update
+
+    triggered_id = ctx_cb.triggered_id
+    if not isinstance(triggered_id, dict):
+        return dash.no_update, dash.no_update
+
+    loop_idx_str = triggered_id.get("index", "-1")
+    try:
+        loop_idx = int(loop_idx_str)
+    except (ValueError, TypeError):
+        return dash.no_update, dash.no_update
+
+    if loop_idx < 0:
+        return dash.no_update, dash.no_update
+
+    return "tab-analysis", loop_idx
+
+
+@app.callback(
+    Output("predictive-alerts-store", "data"),
+    Input("degradation-analysis-store", "data"),
+    State("loops-store", "data"),
+)
+def generate_predictive_alerts(degradation_analysis, loops):
+    if not degradation_analysis or not loops:
+        return []
+
+    predictive_alerts = []
+    ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for da in degradation_analysis:
+        warning_rounds = da.get("warning_rounds")
+        if warning_rounds is not None and warning_rounds <= 3:
+            loop_idx = da.get("loop_idx", -1)
+            loop_name = da.get("loop_name", "未知")
+
+            predictive_alerts.append({
+                "timestamp": ts_now,
+                "loop_idx": loop_idx,
+                "loop_name": loop_name,
+                "rule_id": "predictive-degradation",
+                "rule_name": "劣化趋势预警",
+                "metric": "health_score_trend",
+                "condition": "prediction",
+                "threshold": "60",
+                "current_value": f"预计{warning_rounds:.1f}轮后跌破60分",
+                "severity": "信息",
+                "is_predictive": True,
+            })
+
+    return predictive_alerts
 
 
 if __name__ == "__main__":
