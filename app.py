@@ -3907,20 +3907,20 @@ def _health_prediction_chart(analysis):
     ))
 
     if residual_std > 0:
-        y_upper = [y + 1.96 * residual_std for y in y_fit_actual + y_fit_future]
-        y_lower = [max(0, y - 1.96 * residual_std) for y in y_fit_actual + y_fit_future]
+        y_upper_future = [y + 1.96 * residual_std for y in y_fit_future]
+        y_lower_future = [max(0, y - 1.96 * residual_std) for y in y_fit_future]
         fig.add_trace(go.Scatter(
-            x=x_actual + x_future,
-            y=y_upper,
+            x=x_future,
+            y=y_upper_future,
             mode="lines", line=dict(color="rgba(255,255,255,0)"),
             showlegend=False,
         ))
         fig.add_trace(go.Scatter(
-            x=x_actual + x_future,
-            y=y_lower,
+            x=x_future,
+            y=y_lower_future,
             mode="lines", line=dict(color="rgba(255,255,255,0)"),
             fill="tonexty",
-            fillcolor="rgba(255,255,255,0.1)",
+            fillcolor="rgba(255,255,255,0.15)",
             name="95%预测区间",
         ))
 
@@ -4384,25 +4384,14 @@ def select_prediction_loop(clicks, current_selected, degradation_analysis):
     if not ctx_cb.triggered:
         return dash.no_update
 
-    triggered_id = ctx_cb.triggered_id
-    if not isinstance(triggered_id, dict):
+    triggered_prop = ctx_cb.triggered[0]["prop_id"]
+    try:
+        triggered_id_str = triggered_prop.split(".")[0]
+        triggered_id_dict = json.loads(triggered_id_str)
+        loop_idx = triggered_id_dict.get("index", -1)
+        return loop_idx
+    except (json.JSONDecodeError, KeyError, IndexError):
         return dash.no_update
-
-    loop_idx = triggered_id.get("index", -1)
-    trigger_idx = None
-    for i, c in enumerate(clicks):
-        if c:
-            trigger_idx = i
-            break
-
-    if trigger_idx is None:
-        return dash.no_update
-
-    for i, da in enumerate(degradation_analysis):
-        if i == trigger_idx:
-            return da.get("loop_idx", -1)
-
-    return dash.no_update
 
 
 @app.callback(

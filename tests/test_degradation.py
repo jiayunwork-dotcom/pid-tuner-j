@@ -49,11 +49,27 @@ def test_predict_failure_round():
 
 def test_degradation_arrow():
     print("=== 测试方向箭头 ===")
-    print(f"快速下降 (slope=-3, R²=0.8): {get_degradation_arrow(-3, 0.8)}")
-    print(f"缓慢下降 (slope=-1, R²=0.5): {get_degradation_arrow(-1, 0.5)}")
-    print(f"稳定 (slope=0, R²=0.8): {get_degradation_arrow(0, 0.8)}")
-    print(f"上升 (slope=2, R²=0.7): {get_degradation_arrow(2, 0.7)}")
-    print(f"无趋势 (slope=-0.1, R²=0.1): {get_degradation_arrow(-0.1, 0.1)}")
+    arrow1 = get_degradation_arrow(-3, 0.8)
+    arrow2 = get_degradation_arrow(-1.5, 0.85)
+    arrow3 = get_degradation_arrow(-0.7, 0.7)
+    arrow4 = get_degradation_arrow(-0.2, 0.5)
+    arrow5 = get_degradation_arrow(0, 0.8)
+    arrow6 = get_degradation_arrow(2, 0.7)
+    arrow7 = get_degradation_arrow(-0.1, 0.1)
+    print(f"剧烈下降 (slope=-3, R²=0.8): {arrow1}")
+    print(f"剧烈下降 (slope=-1.5, R²=0.85): {arrow2}")
+    print(f"中等下降 (slope=-0.7, R²=0.7): {arrow3}")
+    print(f"轻微下降 (slope=-0.2, R²=0.5): {arrow4}")
+    print(f"稳定 (slope=0, R²=0.8): {arrow5}")
+    print(f"上升 (slope=2, R²=0.7): {arrow6}")
+    print(f"无趋势 (slope=-0.1, R²=0.1): {arrow7}")
+    assert arrow1 == "↓", "slope=-3应该显示↓"
+    assert arrow2 == "↓", "slope=-1.5应该显示↓"
+    assert arrow3 == "↘", "slope=-0.7应该显示↘"
+    assert arrow4 == "→", "slope=-0.2应该显示→"
+    assert arrow5 == "→", "slope=0应该显示→"
+    assert arrow6 == "↗", "slope=2应该显示↗"
+    assert arrow7 == "→", "R²<0.3应该显示→"
     print("✓ 方向箭头测试通过\n")
 
 

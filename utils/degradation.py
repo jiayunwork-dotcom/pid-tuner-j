@@ -344,9 +344,9 @@ def get_degradation_arrow(slope: float, r_squared: float) -> str:
         return "→"
     if slope > 0.3:
         return "↗"
-    elif slope < -0.5:
+    elif slope < -1.0:
         return "↓"
-    elif slope < -0.2:
+    elif slope < -0.3:
         return "↘"
     else:
         return "→"
