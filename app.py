@@ -4,6 +4,7 @@ import json
 import numpy as np
 import pandas as pd
 import datetime
+import time
 import dash
 from dash import dcc, html, Input, Output, State, callback_context, ALL, MATCH, ctx
 import dash_bootstrap_components as dbc
@@ -24,6 +25,34 @@ app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY],
                 suppress_callback_exceptions=True)
 app.title = "PID调优分析工具"
 server = app.server
+
+app.index_string = """
+<!DOCTYPE html>
+<html>
+<head>
+{%metas%}
+<title>{%title%}</title>
+{%css%}
+<style>
+@keyframes alertBlink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+.alert-escalated-blink {
+    animation: alertBlink 1.2s ease-in-out infinite;
+}
+</style>
+</head>
+<body>
+{%app_entry%}
+<footer>
+{%config%}
+{%scripts%}
+{%renderer%}
+</footer>
+</body>
+</html>
+"""
 
 COLORS = {
     "bg": "#1a1a2e",
@@ -47,6 +76,13 @@ SEVERITY_COLORS = {
     "信息": "#3498db",
 }
 SEVERITY_ORDER = {"紧急": 0, "严重": 1, "警告": 2, "信息": 3}
+SEVERITY_ESCALATION = {"信息": "警告", "警告": "严重", "严重": "紧急", "紧急": "紧急"}
+
+LOOP_COLORS = [
+    "#00d2ff", "#ff6b6b", "#ffd93d", "#27ae60", "#e94560",
+    "#9b59b6", "#1abc9c", "#e67e22", "#3498db", "#f39c12",
+    "#2ecc71", "#e74c3c", "#00bcd4", "#ff5722", "#607d8b",
+]
 
 DEFAULT_ALERT_RULES = [
     {
@@ -208,6 +244,9 @@ app.layout = dbc.Container(fluid=True, style={
     dcc.Store(id="active-tab-store", data="tab-analysis"),
     dcc.Download(id="download-report"),
     dcc.Download(id="download-inspection-csv"),
+    dcc.Store(id="alert-confirm-store", data={}),
+    dcc.Store(id="silence-rules-store", data=[]),
+    dcc.Store(id="health-trend-selected-store", data=[]),
 
     dbc.Modal([
         dbc.ModalHeader(dbc.ModalTitle("多回路性能指标对比")),
@@ -225,6 +264,14 @@ app.layout = dbc.Container(fluid=True, style={
             dbc.Button("关闭", id="btn-close-history", className="ms-auto", size="sm"),
         ]),
     ], id="history-modal", size="xl", scrollable=True, is_open=False),
+
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("巡检对比分析 - 最近两轮")),
+        dbc.ModalBody(id="compare-rounds-modal-body"),
+        dbc.ModalFooter(
+            dbc.Button("关闭", id="btn-close-compare-rounds", className="ms-auto", size="sm")
+        ),
+    ], id="compare-rounds-modal", size="xl", scrollable=True, is_open=False),
 ])
 
 
@@ -276,17 +323,21 @@ def store_active_tab(tab_value):
     Input("alert-records-store", "data"),
     Input("alert-rules-store", "data"),
     Input("inspection-status-store", "data"),
+    Input("alert-confirm-store", "data"),
+    Input("silence-rules-store", "data"),
+    Input("health-trend-selected-store", "data"),
     State("loops-store", "data"),
 )
 def render_tab_content(tab_value, selected, time_ranges, annotations_store, pending_annotation,
-                         metrics_history, inspection_history, alert_records, alert_rules,
-                         inspection_status, loops):
+                       metrics_history, inspection_history, alert_records, alert_rules,
+                       inspection_status, alert_confirms, silence_rules, trend_selected, loops):
     if tab_value == "tab-analysis":
         return _render_analysis_tab(selected, time_ranges, annotations_store, pending_annotation,
                                      metrics_history, loops)
     else:
         return _render_inspection_tab(inspection_history, alert_records, alert_rules,
-                                       inspection_status, loops)
+                                       inspection_status, loops, alert_confirms, silence_rules,
+                                       trend_selected)
 
 
 def _render_analysis_tab(selected, time_ranges, annotations_store, pending_annotation,
@@ -374,7 +425,8 @@ def _render_analysis_tab(selected, time_ranges, annotations_store, pending_annot
 
 
 def _render_inspection_tab(inspection_history, alert_records, alert_rules,
-                            inspection_status, loops):
+                            inspection_status, loops, alert_confirms, silence_rules,
+                            trend_selected):
     return html.Div([
         _inspection_config_panel(inspection_status),
         html.Hr(className="my-3", style={"borderColor": "#333"}),
@@ -382,8 +434,10 @@ def _render_inspection_tab(inspection_history, alert_records, alert_rules,
         html.Hr(className="my-3", style={"borderColor": "#333"}),
         dbc.Row([
             dbc.Col(_alert_rules_panel(alert_rules), width=4),
-            dbc.Col(_alert_display_panel(alert_records, loops), width=8),
+            dbc.Col(_alert_display_panel(alert_records, loops, alert_confirms, silence_rules), width=8),
         ]),
+        html.Hr(className="my-3", style={"borderColor": "#333"}),
+        _health_trend_panel(inspection_history, loops, trend_selected),
     ])
 
 
@@ -450,6 +504,12 @@ def _inspection_summary_panel(inspection_history):
         severity_counts = latest.get("severity_counts", {})
         worst_loops = latest.get("worst_loops", [])
 
+        escalation_count = 0
+        for lr in latest.get("loop_results", []):
+            for a in lr.get("alerts", []):
+                if a.get("escalated", False):
+                    escalation_count += 1
+
         sev_badges = []
         for sev in ["紧急", "严重", "警告", "信息"]:
             cnt = severity_counts.get(sev, 0)
@@ -467,6 +527,15 @@ def _inspection_summary_panel(inspection_history):
                           className="text-warning small"),
             ], className="mb-1"))
 
+        escalation_badge = ""
+        if escalation_count > 0:
+            escalation_badge = html.Div([
+                html.Span("升级告警: ", className="text-light small"),
+                html.Span(f"{escalation_count}", className="badge",
+                          style={"backgroundColor": COLORS["red"], "fontSize": "12px",
+                                 "animation": "alertBlink 1.2s ease-in-out infinite"}),
+            ], className="mt-2")
+
         summary_content = html.Div([
             html.Div([
                 html.Div([
@@ -474,7 +543,8 @@ def _inspection_summary_panel(inspection_history):
                     html.Div([
                         html.Span(f"检查回路: {total_loops} 个", className="text-light me-4"),
                         html.Span("告警统计: ", className="text-light"),
-                    ] + sev_badges, className="mb-3"),
+                    ] + sev_badges, className="mb-2"),
+                    escalation_badge,
                 ]),
             ]),
             html.Div([
@@ -483,12 +553,17 @@ def _inspection_summary_panel(inspection_history):
             ]),
         ])
 
+    compare_disabled = not (inspection_history and len(inspection_history) >= 2)
+
     return html.Div([
         dbc.Card([
             dbc.CardHeader([
                 html.Div([
                     html.H6("巡检报告摘要", className="text-white mb-0 d-inline-block"),
                     html.Div([
+                        dbc.Button([html.I(className="fas fa-exchange-alt me-1"), "对比最近两轮"],
+                                   id="btn-compare-rounds", color="warning", size="sm", outline=True,
+                                   className="me-2", disabled=compare_disabled),
                         dbc.Button([html.I(className="fas fa-download me-1"), "导出最近5轮报告(CSV)"],
                                    id="btn-export-inspection-csv", color="primary", size="sm", outline=True),
                         dbc.Button([html.I(className="fas fa-chevron-down me-1"), "折叠/展开"],
@@ -602,19 +677,40 @@ def _build_alert_rule_card(rule):
     ], style={"backgroundColor": COLORS["card"], "marginBottom": "6px", "border": "1px solid #333"})
 
 
-def _alert_display_panel(alert_records, loops):
-    filtered_alerts = _filter_alerts(alert_records, "all", "")
+def _alert_display_panel(alert_records, loops, alert_confirms, silence_rules):
+    filtered_alerts = _filter_alerts(alert_records, "all", "", alert_confirms)
 
     alert_items = []
     if filtered_alerts:
         for alert in filtered_alerts:
-            alert_items.append(_build_alert_item(alert))
+            alert_items.append(_build_alert_item(alert, alert_confirms))
     else:
         alert_items = [html.P("暂无告警记录", className="text-muted text-center py-4")]
 
     trend_fig = _build_alert_trend_chart(alert_records)
     rank_fig = _build_alert_loop_rank_chart(alert_records)
     pie_fig = _build_alert_severity_pie(alert_records)
+
+    loop_options = [{"label": "全部回路", "value": -1}]
+    if loops:
+        for i, lp in enumerate(loops):
+            loop_options.append({"label": lp["name"], "value": i})
+
+    silence_items = []
+    if silence_rules:
+        for sr in silence_rules:
+            loop_name = "未知"
+            if loops and 0 <= sr.get("loop_idx", -1) < len(loops):
+                loop_name = loops[sr["loop_idx"]]["name"]
+            rule_name = sr.get("rule_name", sr.get("rule_id", ""))
+            dur = sr.get("duration_minutes", 0)
+            start = sr.get("start_time", "")
+            silence_items.append(html.Div([
+                html.Span(f"{loop_name} - {rule_name} ({dur}分钟, 自{start})", className="text-light small"),
+                dbc.Button([html.I(className="fas fa-times")], size="sm", color="danger", outline=True,
+                           className="ms-2", id={"type": "delete-silence", "index": sr.get("id", "")},
+                           style={"fontSize": "10px", "padding": "0 4px"}),
+            ], className="d-flex align-items-center mb-1"))
 
     return dbc.Card([
         dbc.CardBody([
@@ -633,15 +729,25 @@ def _alert_display_panel(alert_records, loops):
                                        {"label": "信息", "value": "信息"},
                                    ], value="all"),
                     ]),
-                ], width=6),
+                ], width=4),
                 dbc.Col([
                     html.Div([
                         dbc.Label("搜索回路:", className="text-light small me-2"),
                         dbc.Input(id="alert-search-input", type="text",
                                   placeholder="输入回路名称...",
-                                  size="sm", style={"width": "180px", "display": "inline-block"}),
+                                  size="sm", style={"width": "150px", "display": "inline-block"}),
                     ]),
-                ], width=6),
+                ], width=4),
+                dbc.Col([
+                    dbc.Checklist(
+                        options=[{"label": " 仅显示活跃", "value": "active_only"}],
+                        value=[],
+                        id="alert-active-only-check",
+                        className="text-light small",
+                        inputClassName="form-check-input",
+                        labelClassName="form-check-label",
+                    ),
+                ], width=4),
             ], className="mb-3"),
             dbc.Row([
                 dbc.Col([
@@ -654,6 +760,23 @@ def _alert_display_panel(alert_records, loops):
                                         "backgroundColor": "#0a1628"}),
                     ]),
                 ], width=12),
+            ], className="mb-3"),
+            html.Hr(className="my-2", style={"borderColor": "#333"}),
+            html.Div([
+                html.H6("静默规则", className="text-warning small mb-2"),
+                html.Div(id="silence-rules-list", children=silence_items if silence_items else [
+                    html.Span("暂无静默规则", className="text-muted small")
+                ], className="mb-2"),
+                dbc.Row([
+                    dbc.Col(dbc.Select(id="silence-loop-select", options=loop_options,
+                                       value=-1, size="sm", className="mb-1"), width=4),
+                    dbc.Col(dbc.Input(id="silence-rule-id-input", placeholder="规则ID",
+                                      size="sm", className="mb-1"), width=3),
+                    dbc.Col(dbc.Input(id="silence-duration-input", type="number",
+                                      placeholder="分钟", value=30, size="sm", className="mb-1"), width=2),
+                    dbc.Col(dbc.Button("添加", id="btn-add-silence", color="warning",
+                                       size="sm", className="w-100 mb-1"), width=3),
+                ]),
             ], className="mb-3"),
             html.Hr(className="my-2", style={"borderColor": "#333"}),
             html.H6("告警统计", className="text-warning small mb-3"),
@@ -674,7 +797,7 @@ def _alert_display_panel(alert_records, loops):
     ], style={"backgroundColor": COLORS["panel"], "height": "100%"})
 
 
-def _filter_alerts(alert_records, severity_filter, search_text):
+def _filter_alerts(alert_records, severity_filter, search_text, alert_confirms=None, active_only=False):
     if not alert_records:
         return []
 
@@ -684,16 +807,58 @@ def _filter_alerts(alert_records, severity_filter, search_text):
             continue
         if search_text and search_text.lower() not in a.get("loop_name", "").lower():
             continue
+        if active_only and alert_confirms and _is_alert_confirmed(a, alert_confirms):
+            continue
         filtered.append(a)
 
-    filtered.sort(key=lambda x: SEVERITY_ORDER.get(x.get("severity", "信息"), 99))
+    def sort_key(x):
+        confirmed = 1 if (alert_confirms and _is_alert_confirmed(x, alert_confirms)) else 0
+        severity = SEVERITY_ORDER.get(x.get("severity", "信息"), 99)
+        return (confirmed, severity)
+
+    filtered.sort(key=sort_key)
     return filtered
 
 
-def _build_alert_item(alert):
+def _is_alert_confirmed(alert, alert_confirms):
+    if not alert_confirms:
+        return False
+    alert_key = _alert_key(alert)
+    return alert_confirms.get(alert_key, False)
+
+
+def _alert_key(alert):
+    return f"{alert.get('loop_idx', -1)}_{alert.get('rule_id', '')}_{alert.get('timestamp', '')}"
+
+
+def _build_alert_item(alert, alert_confirms=None):
     sev = alert.get("severity", "信息")
     sev_color = SEVERITY_COLORS.get(sev, "#666")
     loop_idx = alert.get("loop_idx", -1)
+    is_confirmed = _is_alert_confirmed(alert, alert_confirms) if alert_confirms else False
+    is_escalated = alert.get("escalated", False)
+    alert_key = _alert_key(alert)
+
+    bg_color = "#2a2a3e" if is_confirmed else COLORS["card"]
+    blink_class = "alert-escalated-blink" if is_escalated and not is_confirmed else ""
+    status_text = "已确认" if is_confirmed else "活跃"
+    status_color = "#888" if is_confirmed else COLORS["green"]
+
+    confirm_btn = dbc.Button(
+        [html.I(className="fas fa-check me-1"), "确认" if not is_confirmed else "已确认"],
+        size="sm",
+        color="secondary" if is_confirmed else "success",
+        outline=not is_confirmed,
+        id={"type": "alert-confirm-btn", "index": alert_key},
+        style={"fontSize": "10px", "padding": "2px 6px"},
+    )
+
+    escalation_badge = ""
+    if is_escalated and not is_confirmed:
+        escalation_badge = html.Span("升级", className="badge ms-1",
+                                     style={"backgroundColor": COLORS["red"],
+                                            "fontSize": "9px",
+                                            "animation": "alertBlink 1.2s ease-in-out infinite"})
 
     return dbc.Card([
         dbc.CardBody([
@@ -701,7 +866,10 @@ def _build_alert_item(alert):
                 html.Div([
                     html.Span(sev, className="badge me-2",
                               style={"backgroundColor": sev_color, "fontSize": "10px"}),
+                    escalation_badge,
                     html.Span(alert.get("loop_name", "未知回路"), className="text-white fw-bold small"),
+                    html.Span(f" [{status_text}]", className="small ms-1",
+                              style={"color": status_color, "fontSize": "10px"}),
                 ]),
                 html.Span(alert.get("timestamp", ""), className="text-muted small"),
             ], className="d-flex justify-content-between align-items-start mb-1"),
@@ -712,13 +880,18 @@ def _build_alert_item(alert):
                 html.Span(" | ", className="text-muted small"),
                 html.Span(f"阈值: {alert.get('threshold', '')}", className="text-warning small"),
             ], className="mb-2"),
-            dbc.Button([html.I(className="fas fa-external-link-alt me-1"), "查看回路详情"],
-                       size="sm", color="primary", outline=True,
-                       id={"type": "alert-jump-btn", "index": str(loop_idx)},
-                       style={"fontSize": "11px"}),
+            html.Div([
+                dbc.Button([html.I(className="fas fa-external-link-alt me-1"), "查看回路详情"],
+                           size="sm", color="primary", outline=True,
+                           id={"type": "alert-jump-btn", "index": str(loop_idx)},
+                           style={"fontSize": "11px"}),
+                confirm_btn,
+            ], className="d-flex justify-content-between"),
         ]),
-    ], style={"backgroundColor": COLORS["card"], "marginBottom": "6px",
-              "borderLeft": f"4px solid {sev_color}", "cursor": "pointer"})
+    ], className=blink_class,
+       style={"backgroundColor": bg_color, "marginBottom": "6px",
+              "borderLeft": f"4px solid {sev_color if not is_confirmed else '#555'}",
+              "cursor": "pointer", "opacity": "0.7" if is_confirmed else "1.0"})
 
 
 def _build_alert_trend_chart(alert_records):
@@ -2792,9 +2965,10 @@ def update_inspection_progress(status):
     State("inspection-history-store", "data"),
     State("alert-records-store", "data"),
     State("inspection-status-store", "data"),
+    State("silence-rules-store", "data"),
     prevent_initial_call=True,
 )
-def run_full_inspection(n_intervals, loops, rules, history, alert_records, status):
+def run_full_inspection(n_intervals, loops, rules, history, alert_records, status, silence_rules):
     if not loops or len(loops) == 0:
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
@@ -2820,16 +2994,54 @@ def run_full_inspection(n_intervals, loops, rules, history, alert_records, statu
         if vals:
             metric_means[key] = sum(vals) / len(vals)
 
+    now_dt = datetime.datetime.now()
+    active_silence = []
+    if silence_rules:
+        for sr in silence_rules:
+            try:
+                start_dt = datetime.datetime.strptime(sr["start_time"], "%Y-%m-%d %H:%M:%S")
+                end_dt = start_dt + datetime.timedelta(minutes=sr.get("duration_minutes", 0))
+                if now_dt < end_dt:
+                    active_silence.append(sr)
+            except (ValueError, KeyError):
+                pass
+
+    recent_history = new_history[-3:] if len(new_history) >= 3 else new_history
+
     for i, loop in enumerate(loops):
         result = _evaluate_single_loop(loop, i, rules, metric_means)
-        loop_results.append({
-            "loop_idx": i,
-            "loop_name": loop["name"],
-            "metrics": result["metrics"],
-            "health_score": result["health_score"],
-            "alerts": result["alerts"],
-        })
+
         for alert in result["alerts"]:
+            is_silenced = False
+            for sr in active_silence:
+                if sr.get("loop_idx") == i and sr.get("rule_id") == alert["rule_id"]:
+                    is_silenced = True
+                    break
+            if is_silenced:
+                continue
+
+            is_escalated = False
+            escalated_severity = alert["severity"]
+            if len(recent_history) >= 3:
+                consecutive_count = 0
+                for past_round in recent_history[-3:]:
+                    found = False
+                    for lr in past_round.get("loop_results", []):
+                        if lr.get("loop_idx") == i:
+                            for pa in lr.get("alerts", []):
+                                if pa.get("rule_id") == alert["rule_id"]:
+                                    found = True
+                                    break
+                    if found:
+                        consecutive_count += 1
+                    else:
+                        consecutive_count = 0
+
+                if consecutive_count >= 3:
+                    escalated_severity = SEVERITY_ESCALATION.get(alert["severity"], alert["severity"])
+                    if escalated_severity != alert["severity"]:
+                        is_escalated = True
+
             new_alerts.append({
                 "timestamp": timestamp,
                 "loop_idx": i,
@@ -2840,8 +3052,20 @@ def run_full_inspection(n_intervals, loops, rules, history, alert_records, statu
                 "current_value": alert["current_value"],
                 "threshold": alert["threshold"],
                 "condition": alert["condition"],
-                "severity": alert["severity"],
+                "severity": escalated_severity,
+                "original_severity": alert["severity"] if is_escalated else None,
+                "escalated": is_escalated,
             })
+
+        loop_alerts_for_result = [a for a in new_alerts if a["loop_idx"] == i]
+
+        loop_results.append({
+            "loop_idx": i,
+            "loop_name": loop["name"],
+            "metrics": result["metrics"],
+            "health_score": result["health_score"],
+            "alerts": loop_alerts_for_result,
+        })
 
     severity_counts = {"紧急": 0, "严重": 0, "警告": 0, "信息": 0}
     for alert in new_alerts:
@@ -3002,9 +3226,13 @@ def delete_alert_rule(delete_clicks, rules):
     Input("alert-records-store", "data"),
     Input("alert-severity-filter", "value"),
     Input("alert-search-input", "value"),
+    Input("alert-confirm-store", "data"),
+    Input("alert-active-only-check", "value"),
     prevent_initial_call=True,
 )
-def update_alert_list(alert_records, severity_filter, search_text):
+def update_alert_list(alert_records, severity_filter, search_text, alert_confirms, active_only_values):
+    active_only = "active_only" in (active_only_values or [])
+
     if not alert_records:
         return [html.Div([
             html.I(className="fas fa-check-circle text-success", style={"fontSize": "40px"}),
@@ -3012,7 +3240,7 @@ def update_alert_list(alert_records, severity_filter, search_text):
             html.Span("暂无告警记录", className="text-muted small"),
         ], className="text-center p-5")]
 
-    filtered = _filter_alerts(alert_records, severity_filter, search_text)
+    filtered = _filter_alerts(alert_records, severity_filter, search_text, alert_confirms, active_only)
 
     if not filtered:
         return [html.Div([
@@ -3023,7 +3251,7 @@ def update_alert_list(alert_records, severity_filter, search_text):
 
     items = []
     for i, alert in enumerate(filtered):
-        items.append(_build_alert_item(i, alert))
+        items.append(_build_alert_item(alert, alert_confirms))
     return items
 
 
@@ -3183,6 +3411,83 @@ def update_inspection_summary(history):
 
     total_alerts = sum(sc.values())
 
+    escalation_count = 0
+    for lr in latest.get("loop_results", []):
+        for a in lr.get("alerts", []):
+            if a.get("escalated", False):
+                escalation_count += 1
+
+    escalation_card = None
+    if escalation_count > 0:
+        escalation_card = dbc.Col(dbc.Card([
+            dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.I(className="fas fa-arrow-up", style={"color": COLORS["red"], "fontSize": "28px",
+                                                               "animation": "alertBlink 1.2s ease-in-out infinite"}),
+                ], width="auto"),
+                dbc.Col([
+                    html.Div("升级告警", className="text-white-50 small", style={"opacity": "0.6"}),
+                    html.Div(f"{escalation_count}", className="text-white fw-bold",
+                             style={"fontSize": "22px", "color": COLORS["red"]}),
+                ]),
+            ], className="align-items-center g-2"),
+        ])], style={"background": "rgba(231,76,60,0.12)", "border": f"1px solid rgba(231,76,60,0.5)"}), width=3)
+
+    severity_cards = [
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.I(className="fas fa-fire", style={"color": SEVERITY_COLORS["紧急"], "fontSize": "28px"}),
+                ], width="auto"),
+                dbc.Col([
+                    html.Div("紧急", className="text-white-50 small", style={"opacity": "0.6"}),
+                    html.Div(f"{sc.get('紧急', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["紧急"]}),
+                ]),
+            ], className="align-items-center g-2"),
+        ])], style={"background": "rgba(231,76,60,0.08)", "border": f"1px solid rgba(231,76,60,0.3)"}), width=3),
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.I(className="fas fa-exclamation-circle", style={"color": SEVERITY_COLORS["严重"], "fontSize": "28px"}),
+                ], width="auto"),
+                dbc.Col([
+                    html.Div("严重", className="text-white-50 small", style={"opacity": "0.6"}),
+                    html.Div(f"{sc.get('严重', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["严重"]}),
+                ]),
+            ], className="align-items-center g-2"),
+        ])], style={"background": "rgba(230,126,34,0.08)", "border": f"1px solid rgba(230,126,34,0.3)"}), width=3),
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.I(className="fas fa-exclamation", style={"color": SEVERITY_COLORS["警告"], "fontSize": "28px"}),
+                ], width="auto"),
+                dbc.Col([
+                    html.Div("警告", className="text-white-50 small", style={"opacity": "0.6"}),
+                    html.Div(f"{sc.get('警告', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["警告"]}),
+                ]),
+            ], className="align-items-center g-2"),
+        ])], style={"background": "rgba(243,156,18,0.08)", "border": f"1px solid rgba(243,156,18,0.3)"}), width=3),
+        dbc.Col(dbc.Card([
+            dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.I(className="fas fa-info", style={"color": SEVERITY_COLORS["信息"], "fontSize": "28px"}),
+                ], width="auto"),
+                dbc.Col([
+                    html.Div("信息", className="text-white-50 small", style={"opacity": "0.6"}),
+                    html.Div(f"{sc.get('信息', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["信息"]}),
+                ]),
+            ], className="align-items-center g-2"),
+        ])], style={"background": "rgba(52,152,219,0.08)", "border": f"1px solid rgba(52,152,219,0.3)"}), width=3),
+    ]
+
+    if escalation_card:
+        severity_cards.append(escalation_card)
+
     children = [
         dbc.Row([
             dbc.Col(html.Div([
@@ -3206,56 +3511,7 @@ def update_inspection_summary(history):
             ]), width=2),
         ], className="mb-4 g-4"),
 
-        dbc.Row([
-            dbc.Col(dbc.Card([
-                dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        html.I(className="fas fa-fire", style={"color": SEVERITY_COLORS["紧急"], "fontSize": "28px"}),
-                    ], width="auto"),
-                    dbc.Col([
-                        html.Div("紧急", className="text-white-50 small", style={"opacity": "0.6"}),
-                        html.Div(f"{sc.get('紧急', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["紧急"]}),
-                    ]),
-                ], className="align-items-center g-2"),
-            ])], style={"background": "rgba(231,76,60,0.08)", "border": f"1px solid rgba(231,76,60,0.3)"}), width=3),
-            dbc.Col(dbc.Card([
-                dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        html.I(className="fas fa-exclamation-circle", style={"color": SEVERITY_COLORS["严重"], "fontSize": "28px"}),
-                    ], width="auto"),
-                    dbc.Col([
-                        html.Div("严重", className="text-white-50 small", style={"opacity": "0.6"}),
-                        html.Div(f"{sc.get('严重', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["严重"]}),
-                    ]),
-                ], className="align-items-center g-2"),
-            ])], style={"background": "rgba(230,126,34,0.08)", "border": f"1px solid rgba(230,126,34,0.3)"}), width=3),
-            dbc.Col(dbc.Card([
-                dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        html.I(className="fas fa-exclamation", style={"color": SEVERITY_COLORS["警告"], "fontSize": "28px"}),
-                    ], width="auto"),
-                    dbc.Col([
-                        html.Div("警告", className="text-white-50 small", style={"opacity": "0.6"}),
-                        html.Div(f"{sc.get('警告', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["警告"]}),
-                    ]),
-                ], className="align-items-center g-2"),
-            ])], style={"background": "rgba(243,156,18,0.08)", "border": f"1px solid rgba(243,156,18,0.3)"}), width=3),
-            dbc.Col(dbc.Card([
-                dbc.CardBody([
-                dbc.Row([
-                    dbc.Col([
-                        html.I(className="fas fa-info", style={"color": SEVERITY_COLORS["信息"], "fontSize": "28px"}),
-                    ], width="auto"),
-                    dbc.Col([
-                        html.Div("信息", className="text-white-50 small", style={"opacity": "0.6"}),
-                        html.Div(f"{sc.get('信息', 0)}", className="text-white fw-bold", style={"fontSize": "22px", "color": SEVERITY_COLORS["信息"]}),
-                    ]),
-                ], className="align-items-center g-2"),
-            ])], style={"background": "rgba(52,152,219,0.08)", "border": f"1px solid rgba(52,152,219,0.3)"}), width=3),
-        ], className="g-3 mb-4"),
+        dbc.Row(severity_cards, className="g-3 mb-4"),
 
         html.Div([
             html.Div([
@@ -3286,6 +3542,359 @@ def update_inspection_summary(history):
     ]
 
     return [c for c in children if c is not None]
+
+
+def _health_trend_panel(inspection_history, loops, trend_selected):
+    if not inspection_history or len(inspection_history) == 0:
+        return dbc.Card([
+            dbc.CardBody([
+                html.H6("健康趋势", className="text-white mb-2"),
+                html.P("暂无巡检数据", className="text-muted text-center py-4"),
+            ]),
+        ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
+
+    recent_rounds = inspection_history[-20:] if len(inspection_history) > 20 else inspection_history
+
+    loop_scores = {}
+    for rnd_idx, rnd in enumerate(recent_rounds):
+        for lr in rnd.get("loop_results", []):
+            name = lr.get("loop_name", "")
+            score = lr.get("health_score", 0)
+            if name not in loop_scores:
+                loop_scores[name] = []
+            loop_scores[name].append((rnd_idx, score))
+
+    loop_names = list(loop_scores.keys())
+    loop_options = [{"label": n, "value": n} for n in loop_names]
+
+    if not trend_selected:
+        sorted_loops = sorted(loop_scores.items(), key=lambda x: x[1][-1][1] if x[1] else 999)
+        default_selected = [x[0] for x in sorted_loops[:3]]
+    else:
+        default_selected = [s for s in trend_selected if s in loop_names]
+        if not default_selected and loop_names:
+            sorted_loops = sorted(loop_scores.items(), key=lambda x: x[1][-1][1] if x[1] else 999)
+            default_selected = [x[0] for x in sorted_loops[:3]]
+
+    fig = go.Figure()
+    declining_loops = []
+    for name in default_selected:
+        if name not in loop_scores:
+            continue
+        data = loop_scores[name]
+        x_vals = [d[0] for d in data]
+        y_vals = [d[1] for d in data]
+        color_idx = loop_names.index(name) if name in loop_names else 0
+        color = LOOP_COLORS[color_idx % len(LOOP_COLORS)]
+
+        fig.add_trace(go.Scatter(
+            x=x_vals, y=y_vals, mode="lines+markers", name=name,
+            line=dict(color=color, width=2),
+            marker=dict(size=5),
+        ))
+
+        if len(y_vals) >= 5:
+            is_declining = True
+            for j in range(len(y_vals) - 4):
+                segment = y_vals[j:j+5]
+                if all(segment[k] > segment[k+1] for k in range(4)):
+                    is_declining = True
+                    break
+            else:
+                is_declining = False
+
+            if is_declining:
+                declining_loops.append(name)
+                last_x = x_vals[-1]
+                last_y = y_vals[-1]
+                fig.add_annotation(
+                    x=last_x, y=last_y,
+                    text="▼",
+                    showarrow=False,
+                    font=dict(color=COLORS["red"], size=16),
+                    xanchor="left", yanchor="bottom",
+                )
+
+    fig.update_layout(
+        title=dict(text="回路健康评分趋势 (最近20轮)", font=dict(color="white", size=13)),
+        paper_bgcolor="#0a1628", plot_bgcolor="#0a1628",
+        font=dict(color="#ccc", size=10), height=320,
+        margin=dict(l=50, r=20, t=40, b=40),
+        xaxis=dict(title="巡检轮次", gridcolor="#333"),
+        yaxis=dict(title="健康评分", gridcolor="#333", range=[0, 105]),
+        legend=dict(orientation="h", y=1.12, font=dict(size=9)),
+    )
+
+    declining_html = html.Div()
+    if declining_loops:
+        items = [html.Span(f"{n} ", className="text-danger small fw-bold") for n in declining_loops]
+        declining_html = html.Div([
+            html.I(className="fas fa-arrow-down text-danger me-1"),
+            html.Span("连续5轮评分下降: ", className="text-warning small"),
+        ] + items, className="mt-2 p-2",
+            style={"backgroundColor": "rgba(231,76,60,0.1)", "borderRadius": "4px"})
+
+    return dbc.Card([
+        dbc.CardBody([
+            html.Div([
+                html.H6("健康趋势", className="text-white mb-0"),
+                dcc.Dropdown(
+                    id="health-trend-loop-select",
+                    options=loop_options,
+                    value=default_selected,
+                    multi=True,
+                    placeholder="选择回路...",
+                    style={"width": "300px", "fontSize": "11px"},
+                    className="ms-3",
+                ),
+            ], className="d-flex align-items-center mb-3"),
+            dcc.Graph(id="health-trend-chart", figure=fig,
+                      config={"displayModeBar": False}, style={"height": "320px"}),
+            html.Div(id="health-trend-warnings", children=declining_html),
+        ]),
+    ], style={"backgroundColor": COLORS["panel"], "marginBottom": "10px"})
+
+
+@app.callback(
+    Output("alert-confirm-store", "data"),
+    Input({"type": "alert-confirm-btn", "index": ALL}, "n_clicks"),
+    State("alert-confirm-store", "data"),
+    prevent_initial_call=True,
+)
+def handle_alert_confirm(clicks, alert_confirms):
+    if not clicks or all(c is None or c == 0 for c in clicks):
+        return dash.no_update
+
+    ctx_cb = callback_context
+    if not ctx_cb.triggered:
+        return dash.no_update
+
+    triggered = ctx_cb.triggered_id
+    if not triggered:
+        return dash.no_update
+
+    try:
+        alert_key = triggered.get("index", "") if isinstance(triggered, dict) else ""
+    except (AttributeError, KeyError):
+        return dash.no_update
+
+    if not alert_key:
+        return dash.no_update
+
+    confirms = dict(alert_confirms) if alert_confirms else {}
+    confirms[alert_key] = not confirms.get(alert_key, False)
+    return confirms
+
+
+@app.callback(
+    Output("silence-rules-store", "data"),
+    Input("btn-add-silence", "n_clicks"),
+    Input({"type": "delete-silence", "index": ALL}, "n_clicks"),
+    State("silence-loop-select", "value"),
+    State("silence-rule-id-input", "value"),
+    State("silence-duration-input", "value"),
+    State("silence-rules-store", "data"),
+    State("alert-rules-store", "data"),
+    prevent_initial_call=True,
+)
+def handle_silence_rules(add_clicks, delete_clicks, loop_idx, rule_id, duration,
+                          silence_rules, alert_rules):
+    ctx_cb = callback_context
+    triggered = ctx_cb.triggered_id
+
+    rules = list(silence_rules) if silence_rules else []
+
+    if isinstance(triggered, dict) and triggered.get("type") == "delete-silence":
+        sr_id = triggered.get("index", "")
+        rules = [r for r in rules if r.get("id", "") != sr_id]
+        return rules
+
+    if triggered == "btn-add-silence":
+        if add_clicks is None or add_clicks == 0:
+            return dash.no_update
+        if loop_idx is None or loop_idx < 0 or not rule_id or not duration:
+            return dash.no_update
+
+        rule_name = rule_id
+        for r in (alert_rules or []):
+            if r.get("id") == rule_id:
+                rule_name = r.get("name", rule_id)
+                break
+
+        new_rule = {
+            "id": f"silence-{int(time.time())}",
+            "loop_idx": loop_idx,
+            "rule_id": rule_id,
+            "rule_name": rule_name,
+            "start_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_minutes": int(duration),
+        }
+        rules.append(new_rule)
+        return rules
+
+    return dash.no_update
+
+
+@app.callback(
+    Output("compare-rounds-modal", "is_open"),
+    Output("compare-rounds-modal-body", "children"),
+    Input("btn-compare-rounds", "n_clicks"),
+    Input("btn-close-compare-rounds", "n_clicks"),
+    State("inspection-history-store", "data"),
+    State("compare-rounds-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_compare_rounds_modal(open_clicks, close_clicks, history, is_open):
+    triggered = ctx.triggered_id
+
+    if triggered == "btn-close-compare-rounds":
+        return False, []
+
+    if triggered == "btn-compare-rounds":
+        if not history or len(history) < 2:
+            return True, html.P("至少需要2轮巡检数据才能对比", className="text-muted")
+
+        current = history[-1]
+        previous = history[-2]
+
+        metric_keys = ["harris_index", "osc_amplitude_pct", "stiction_severity",
+                       "overshoot_pct", "steady_state_error", "health_score"]
+        metric_labels = {
+            "harris_index": "Harris指标",
+            "osc_amplitude_pct": "振荡幅度(%)",
+            "stiction_severity": "粘滞程度",
+            "overshoot_pct": "过冲量(%)",
+            "steady_state_error": "稳态误差",
+            "health_score": "健康评分",
+        }
+
+        current_by_name = {}
+        for lr in current.get("loop_results", []):
+            current_by_name[lr["loop_name"]] = lr
+        previous_by_name = {}
+        for lr in previous.get("loop_results", []):
+            previous_by_name[lr["loop_name"]] = lr
+
+        all_loop_names = list(set(list(current_by_name.keys()) + list(previous_by_name.keys())))
+        all_loop_names.sort()
+
+        table_header = ["回路", "指标", "当前值", "上轮值", "变化量", "变化率"]
+        table_rows = []
+
+        for name in all_loop_names:
+            cur_lr = current_by_name.get(name, {})
+            prev_lr = previous_by_name.get(name, {})
+
+            for mk in metric_keys:
+                cur_val = cur_lr.get(mk, None)
+                prev_val = prev_lr.get(mk, None)
+
+                if cur_val is None and prev_val is None:
+                    continue
+
+                if isinstance(cur_val, (int, float)) and isinstance(prev_val, (int, float)):
+                    change = cur_val - prev_val
+                    if abs(prev_val) > 1e-9:
+                        change_rate = change / abs(prev_val) * 100
+                    else:
+                        change_rate = 0.0
+                    cur_str = f"{cur_val:.4f}" if isinstance(cur_val, float) else str(cur_val)
+                    prev_str = f"{prev_val:.4f}" if isinstance(prev_val, float) else str(prev_val)
+                    change_str = f"{change:+.4f}"
+                    rate_str = f"{change_rate:+.1f}%"
+
+                    style = {}
+                    if abs(change_rate) > 20:
+                        style = {"color": COLORS["red"], "fontWeight": "bold"}
+                else:
+                    cur_str = str(cur_val) if cur_val is not None else "N/A"
+                    prev_str = str(prev_val) if prev_val is not None else "N/A"
+                    change_str = "-"
+                    rate_str = "-"
+                    style = {}
+
+                table_rows.append(html.Tr([
+                    html.Td(name, className="text-light small p-2"),
+                    html.Td(metric_labels.get(mk, mk), className="text-info small p-2"),
+                    html.Td(cur_str, className="text-white small p-2"),
+                    html.Td(prev_str, className="text-white small p-2"),
+                    html.Td(change_str, className="text-white small p-2", style=style),
+                    html.Td(rate_str, className="text-white small p-2", style=style),
+                ]))
+
+        comparison_table = html.Table(
+            [html.Thead(html.Tr([html.Th(h, className="text-warning small p-2") for h in table_header]))] +
+            [html.Tbody(table_rows)],
+            className="w-100 table table-dark table-striped",
+            style={"fontSize": "11px", "borderCollapse": "collapse"}
+        )
+
+        cur_scores = []
+        prev_scores = []
+        loop_names_chart = []
+        for name in all_loop_names:
+            cur_lr = current_by_name.get(name, {})
+            prev_lr = previous_by_name.get(name, {})
+            cur_score = cur_lr.get("health_score", None)
+            prev_score = prev_lr.get("health_score", None)
+            if cur_score is not None and prev_score is not None:
+                cur_scores.append(cur_score)
+                prev_scores.append(prev_score)
+                loop_names_chart.append(name)
+
+        bar_colors_cur = []
+        bar_colors_prev = []
+        for i, name in enumerate(loop_names_chart):
+            if cur_scores[i] < prev_scores[i]:
+                bar_colors_cur.append(COLORS["red"])
+            else:
+                bar_colors_cur.append(COLORS["green"])
+            bar_colors_prev.append("#555")
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=loop_names_chart, y=prev_scores, name="上轮评分",
+            marker_color=bar_colors_prev,
+            text=[f"{s:.1f}" for s in prev_scores], textposition="outside",
+            textfont=dict(color="#ccc", size=9),
+        ))
+        fig.add_trace(go.Bar(
+            x=loop_names_chart, y=cur_scores, name="当前评分",
+            marker_color=bar_colors_cur,
+            text=[f"{s:.1f}" for s in cur_scores], textposition="outside",
+            textfont=dict(color="#ccc", size=9),
+        ))
+        fig.update_layout(
+            title=dict(text="健康评分两轮对比 (红色=评分下降)", font=dict(color="white", size=12)),
+            paper_bgcolor="#0a1628", plot_bgcolor="#0a1628",
+            font=dict(color="#ccc", size=10), height=300,
+            margin=dict(l=50, r=20, t=40, b=60),
+            xaxis=dict(gridcolor="#333", tickangle=30),
+            yaxis=dict(gridcolor="#333", title="健康评分", range=[0, 105]),
+            barmode="group",
+            legend=dict(orientation="h", y=1.12),
+        )
+
+        content = html.Div([
+            html.H6(f"对比: 当前轮({current['timestamp']}) vs 上一轮({previous['timestamp']})",
+                     className="text-white mb-3"),
+            html.Div(className="table-responsive", children=[comparison_table]),
+            html.Hr(className="my-4", style={"borderColor": "#333"}),
+            dcc.Graph(figure=fig, config={"displayModeBar": False}),
+        ])
+
+        return True, content
+
+    return dash.no_update, dash.no_update
+
+
+@app.callback(
+    Output("health-trend-selected-store", "data"),
+    Input("health-trend-loop-select", "value"),
+    prevent_initial_call=True,
+)
+def update_trend_selected(selected_loops):
+    return selected_loops or []
 
 
 if __name__ == "__main__":
